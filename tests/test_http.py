@@ -33,6 +33,10 @@ WRITE_OK = (
     "<ResponseStatus><statusCode>1</statusCode>"
     "<statusString>OK</statusString></ResponseStatus>"
 )
+EMPTY_FAR_LAMP = (
+    "<infraredFarLampPower>100</infraredFarLampPower>",
+    "<infraredFarLampPower/>",
+)
 EXTRA_DETECTION = (
     "<regionType>grid</regionType>"
     "<Grid><rowGranularity>18</rowGranularity>"
@@ -93,6 +97,10 @@ class FakeCamera:
         self.valid_session = None
         self.logon_override = None
         self.denied_status = 401
+        self.password = PASSWORD
+        self.hold_user_check = False
+        self.user_check_seen = asyncio.Event()
+        self.release = asyncio.Event()
         self.port = None
         self.app = web.Application()
         self.app.router.add_route("*", "/{path:.*}", self.handle)
@@ -123,6 +131,9 @@ class FakeCamera:
         if not self.allows(seen):
             return self.denied()
         self.authorized.append(seen)
+        if seen.path == USER_CHECK and self.hold_user_check:
+            self.user_check_seen.set()
+            await self.release.wait()
         return self.reply(*self.replies.get((seen.method, seen.path), (404, "")))
 
     def session_check_reply(self):
@@ -175,7 +186,7 @@ class FakeCamera:
         def md5(text):
             return hashlib.md5(text.encode()).hexdigest()
 
-        ha1 = md5(f"{USER}:{REALM}:{PASSWORD}")
+        ha1 = md5(f"{USER}:{REALM}:{self.password}")
         ha2 = md5(f"{seen.method}:{fields.get('uri')}")
         response = md5(
             f"{ha1}:{fields.get('nonce')}:{fields.get('nc')}:"
@@ -207,12 +218,12 @@ class FakeCamera:
 async def start_camera():
     runners = []
 
-    async def start(auth="session"):
+    async def start(auth="session", host="127.0.0.1"):
         fake = FakeCamera(auth)
         runner = web.AppRunner(fake.app)
         await runner.setup()
         runners.append(runner)
-        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        await web.TCPSite(runner, host, 0).start()
         fake.port = runner.addresses[0][1]
         return fake
 
@@ -225,8 +236,8 @@ async def start_camera():
 async def make_client():
     clients = []
 
-    def make(port, password=PASSWORD, **kwargs):
-        client = HttpClient("127.0.0.1", USER, password, port=port, **kwargs)
+    def make(port, password=PASSWORD, host="127.0.0.1", **kwargs):
+        client = HttpClient(host, USER, password, port=port, **kwargs)
         clients.append(client)
         return client
 
@@ -331,6 +342,29 @@ async def test_set_light_omits_times_the_camera_did_not_send(examples, camera, c
 
     (sent,) = camera.sent("PUT")
     assert sent.body == edit(put.body, *changes)
+
+
+async def test_get_light_reads_an_empty_lamp_element_as_missing(
+    examples, camera, client
+):
+    get = load(examples, "http_whitelight_get_reply")
+    camera.serve("GET", get.path, edit(get.body, EMPTY_FAR_LAMP))
+
+    state = await client.get_light()
+
+    assert (state.far_power, state.power) == (None, 100)
+
+
+async def test_set_light_leaves_out_an_empty_lamp_element(examples, camera, client):
+    get = load(examples, "http_whitelight_get_reply")
+    put = load(examples, "http_whitelight_set_manual_on")
+    camera.serve("GET", get.path, edit(get.body, EMPTY_FAR_LAMP))
+    camera.serve(put.method, put.path, WRITE_OK)
+
+    await client.set_light(True)
+
+    (sent,) = camera.sent("PUT")
+    assert sent.body == edit(put.body, (EMPTY_FAR_LAMP[0], ""))
 
 
 async def test_set_light_mode_smart_sends_example_body(examples, camera, client):
@@ -786,6 +820,31 @@ async def test_failed_digest_login_is_retried_on_the_next_call(
     ]
 
 
+async def test_cancelled_digest_login_is_retried_on_the_next_call(
+    examples, start_camera, make_client
+):
+    camera = await start_camera("digest")
+    get = load(examples, "http_whitelight_get_reply")
+    camera.serve_reply(get)
+    camera.serve("GET", USER_CHECK, USER_CHECK_OK)
+    camera.hold_user_check = True
+    client = make_client(camera.port)
+    call = asyncio.create_task(client.get_light())
+    await camera.user_check_seen.wait()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    camera.release.set()
+
+    await client.get_light()
+
+    assert [seen.path for seen in camera.authorized] == [
+        USER_CHECK,
+        USER_CHECK,
+        get.path,
+    ]
+
+
 async def test_digest_login_needs_an_ok_status(start_camera, make_client):
     camera = await start_camera("digest")
     refused = edit(USER_CHECK_OK, ("<statusString>OK<", "<statusString>BAD<"))
@@ -898,6 +957,34 @@ async def test_reply_variants_still_parse(examples, camera, client, wrap):
 
     assert state.control == 0
     assert state.on_time == "18:00:00"
+
+
+async def test_user_check_query_carries_reserved_characters(
+    examples, start_camera, make_client
+):
+    password = "p&ss w+rd#%"
+    camera = await start_camera("digest")
+    camera.password = password
+    camera.serve_reply(load(examples, "http_whitelight_get_reply"))
+    camera.serve("GET", USER_CHECK, USER_CHECK_OK)
+    client = make_client(camera.port, password=password)
+
+    await client.get_light()
+
+    assert camera.authorized[0].query == {"username": USER, "passwd": password}
+
+
+async def test_ipv6_host_is_bracketed_in_the_url(examples, start_camera, make_client):
+    try:
+        camera = await start_camera(host="::1")
+    except OSError:
+        pytest.skip("no IPv6 loopback")
+    camera.serve_reply(load(examples, "http_whitelight_get_reply"))
+    client = make_client(camera.port, host="::1")
+
+    state = await client.get_light()
+
+    assert state.control == 0
 
 
 async def test_given_session_carries_the_requests_and_stays_open(

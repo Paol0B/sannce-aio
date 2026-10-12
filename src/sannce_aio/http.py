@@ -4,7 +4,6 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import aiohttp
-from yarl import URL
 
 from .errors import AuthError, ConnectError, ProtocolError
 
@@ -64,8 +63,8 @@ class HttpClient:
         port: int = 80,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
-        self._host = host
-        self._port = port
+        netloc = f"[{host}]" if ":" in host else host
+        self._base_url = f"http://{netloc}:{port}"
         self._username = username
         self._password = password
         self._session = session
@@ -208,17 +207,14 @@ class HttpClient:
         return True
 
     async def _digest_login(self) -> None:
-        self._digest = aiohttp.DigestAuthMiddleware(self._username, self._password)
+        digest = aiohttp.DigestAuthMiddleware(self._username, self._password)
         # the app puts the credentials in the query too (protocol.md, Authentication)
         query = {"username": self._username, "passwd": self._password}
-        try:
-            status, raw = await self._send("GET", _USER_CHECK, query=query)
-            _check_status("GET", _USER_CHECK, status)
-            if _text(_parse(raw, "userCheck"), "statusString") != "OK":
-                raise AuthError("the camera refused the login")
-        except Exception:
-            self._digest = None
-            raise
+        status, raw = await self._send("GET", _USER_CHECK, query=query, digest=digest)
+        _check_status("GET", _USER_CHECK, status)
+        if _text(_parse(raw, "userCheck"), "statusString") != "OK":
+            raise AuthError("the camera refused the login")
+        self._digest = digest
 
     async def _send(
         self,
@@ -227,23 +223,24 @@ class HttpClient:
         body: str | None = None,
         *,
         query: dict[str, str] | None = None,
+        digest: aiohttp.DigestAuthMiddleware | None = None,
     ) -> tuple[int, bytes]:
-        url = URL.build(
-            scheme="http", host=self._host, port=self._port, path=path, query=query
-        )
         headers = {} if body is None else dict(_XML)
         if self._session_id is not None:
             headers["HttpSession"] = self._session_id
         if self._session is None:
             self._session = aiohttp.ClientSession()
+        if digest is None:
+            digest = self._digest
         try:
             async with self._session.request(
                 method,
-                url,
+                self._base_url + path,
+                params=query,
                 data=None if body is None else body.encode(),
                 headers=headers,
                 timeout=_TIMEOUT,
-                middlewares=None if self._digest is None else (self._digest,),
+                middlewares=None if digest is None else (digest,),
             ) as response:
                 return response.status, await response.read()
         except (aiohttp.ClientError, TimeoutError) as error:
@@ -256,7 +253,6 @@ def _path(template: str, channel: int) -> str:
     return template.format(channel)
 
 
-# protocol.md, HTTP API, Authentication: session login
 def _logon_secret(username: str, password: str, key: str, rounds: int) -> str:
     digest = _sha256(username + password)
     for _ in range(rounds):
@@ -310,7 +306,7 @@ def _text(parent: ET.Element, name: str) -> str | None:
 
 def _int(parent: ET.Element, name: str) -> int | None:
     text = _text(parent, name)
-    if text is None:
+    if not text:
         return None
     try:
         return int(text)
