@@ -3,7 +3,8 @@ import ipaddress
 import logging
 import socket
 import struct
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from .errors import ProtocolError
@@ -18,7 +19,7 @@ TARGETS = (
     ("239.255.255.250", 3000),
     ("239.255.255.250", 4000),
 )
-SEARCH_PORTS = (3000, 4000)
+SEARCH_PORTS = tuple(sorted({port for _, port in TARGETS}))
 
 _MAGIC = 0xE5E5BEBE
 _ENVELOPE = struct.Struct("<IHHH")
@@ -92,19 +93,8 @@ def parse_discovery_reply(datagram: bytes, source_ip: str = "") -> DiscoveredCam
 
 
 async def discover(timeout: float = 3.0) -> list[DiscoveredCamera]:
-    loop = asyncio.get_running_loop()
-    transport, collector = await loop.create_datagram_endpoint(
-        _Collector, sock=_open_socket()
-    )
-    try:
-        request = build_seek_request()
-        for target in TARGETS:
-            transport.sendto(request, target)
+    async with _search(TARGETS) as collector:
         await asyncio.sleep(timeout)
-    finally:
-        transport.close()
-        # the loop closes the socket on its next turn; yield so port 6001 is free
-        await asyncio.sleep(0)
     return list(collector.cameras.values())
 
 
@@ -113,23 +103,13 @@ async def find_camera(ip: str, timeout: float = 2.0) -> DiscoveredCamera | None:
         ipaddress.IPv4Address(ip)
     except ValueError:
         return None
-    loop = asyncio.get_running_loop()
-    transport, collector = await loop.create_datagram_endpoint(
-        lambda: _Collector(ip), sock=_open_socket()
-    )
-    try:
-        request = build_seek_request()
-        # the vendor client asks one address too (protocol.md)
-        for target in (*TARGETS, *((ip, port) for port in SEARCH_PORTS)):
-            transport.sendto(request, target)
+    # the vendor client asks one address too (protocol.md)
+    targets = (*TARGETS, *((ip, port) for port in SEARCH_PORTS))
+    async with _search(targets, ip) as collector:
         try:
             return await asyncio.wait_for(collector.match, timeout)
         except TimeoutError:
             return None
-    finally:
-        transport.close()
-        # the loop closes the socket on its next turn; yield so port 6001 is free
-        await asyncio.sleep(0)
 
 
 class _Collector(asyncio.DatagramProtocol):
@@ -152,6 +132,25 @@ class _Collector(asyncio.DatagramProtocol):
 
     def error_received(self, exc: Exception) -> None:
         _LOG.debug("send failed: %s", exc)
+
+
+@asynccontextmanager
+async def _search(
+    targets: Iterable[tuple[str, int]], wanted: str = ""
+) -> AsyncIterator[_Collector]:
+    loop = asyncio.get_running_loop()
+    transport, collector = await loop.create_datagram_endpoint(
+        lambda: _Collector(wanted), sock=_open_socket()
+    )
+    try:
+        request = build_seek_request()
+        for target in targets:
+            transport.sendto(request, target)
+        yield collector
+    finally:
+        transport.close()
+        # the loop closes the socket on its next turn; yield so port 6001 is free
+        await asyncio.sleep(0)
 
 
 def _open_socket() -> socket.socket:

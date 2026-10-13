@@ -15,7 +15,6 @@ from aiohttp.typedefs import Handler
 
 from .audio import decode_alaw
 from .discovery import (
-    TARGETS,
     DiscoveredCamera,
     build_seek_reply,
     is_seek_request,
@@ -31,7 +30,6 @@ DEFAULT_SERIAL = "SIM0000000001"
 # RFC 7042 documentation address, so it never matches a real device
 DEFAULT_MAC = "00:00:5E:00:53:01"
 MAC_SHAPE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
-SEARCH_PORTS = tuple(sorted({port for _, port in TARGETS}))
 
 _READ_SIZE = 0x10000
 _SEQ_WRAP = 0x10000

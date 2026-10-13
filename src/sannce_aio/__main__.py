@@ -9,7 +9,7 @@ from typing import TextIO
 
 from .camera import SannceCamera
 from .control import start_control
-from .discovery import discover
+from .discovery import SEARCH_PORTS, discover
 from .errors import SannceError
 from .events import Event
 from .simulator import (
@@ -17,7 +17,6 @@ from .simulator import (
     DEFAULT_MODEL,
     DEFAULT_SERIAL,
     MAC_SHAPE,
-    SEARCH_PORTS,
     CameraSimulator,
 )
 

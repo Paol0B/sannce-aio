@@ -525,6 +525,11 @@ async def simulate(monkeypatch):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def test_simulate_answers_on_the_ports_discovery_asks():
+    assert cli.SEARCH_PORTS is discovery.SEARCH_PORTS
+    assert discovery.SEARCH_PORTS == (3000, 4000)
+
+
 async def test_simulate_defaults():
     args = cli.build_parser().parse_args(["simulate"])
 
