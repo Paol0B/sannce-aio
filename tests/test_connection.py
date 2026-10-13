@@ -341,6 +341,31 @@ async def test_reconnect_gives_up_after_repeated_auth_failure():
 
 
 @pytest.mark.asyncio
+async def test_reconnect_give_up_reports_the_auth_error_once():
+    camera = FakeCamera(reject_reconnect=True)
+    await camera.start()
+    failures = []
+    conn = make_connection(
+        camera,
+        on_login_failed=failures.append,
+        heartbeat_interval=0.05,
+        backoff_start=0.01,
+        backoff_max=0.02,
+        login_timeout=0.1,
+        auth_failure_limit=3,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        await camera.drop_client()
+        await wait_until(lambda: conn._run_task.done(), timeout=5.0)
+        assert len(failures) == 1
+        assert isinstance(failures[0], AuthError)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_keeps_retrying_after_a_reset_during_login():
     camera = FakeCamera()
     await camera.start()

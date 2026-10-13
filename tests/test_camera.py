@@ -352,6 +352,26 @@ async def test_on_availability_reports_up_then_down(make_camera):
     assert states == [True, False]
 
 
+async def test_on_login_failed_reports_a_refused_reconnect(simulator, make_camera):
+    camera = make_camera()
+    failures = []
+    states = []
+    camera.on_login_failed(failures.append)
+    camera.on_availability(states.append)
+    await camera.connect()
+    # the default 1 s backoff would make this test take seconds
+    camera._conn._backoff_start = 0.01
+    simulator.password = "changed"
+
+    for session in list(simulator._sessions):
+        session.writer.close()
+    await wait_until(lambda: failures, timeout=5.0)
+
+    assert len(failures) == 1
+    assert isinstance(failures[0], AuthError)
+    assert states == [True, False]
+
+
 async def test_play_audio_streams_rechunked_frames_and_stops_talk(
     simulator, make_camera
 ):

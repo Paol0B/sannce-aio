@@ -41,6 +41,7 @@ class NvsConnection:
         *,
         on_event: Callable[[Event], None],
         on_availability: Callable[[bool], None],
+        on_login_failed: Callable[[AuthError], None] | None = None,
         request_timeout: float = 10.0,
         heartbeat_interval: float = 3.0,
         login_timeout: float = 10.0,
@@ -53,6 +54,7 @@ class NvsConnection:
         self._login = login
         self._on_event = on_event
         self._on_availability = on_availability
+        self._on_login_failed = on_login_failed
         self._request_timeout = request_timeout
         self._heartbeat_interval = heartbeat_interval
         self._login_timeout = login_timeout
@@ -170,6 +172,8 @@ class NvsConnection:
                         auth_failures,
                         exc,
                     )
+                    if self._on_login_failed is not None:
+                        self._emit(self._on_login_failed, exc, "login failure")
                     return False
                 _log.warning(
                     "reconnect login failed (%s), attempt %d of %d; retrying in %.1fs",

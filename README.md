@@ -73,6 +73,7 @@ The same user and password go to the private protocol and to HTTP. `host` must n
 | `rtsp_url(stream="main")` | `rtsp://user:pass@host:554/1/1`. `"sub"` gives `/1/2`. User and password are percent-encoded. Other values raise `ValueError`. |
 | `subscribe(callback)` | Calls `callback(Event)` for each event. Returns a function that removes the callback. |
 | `on_availability(callback)` | Calls `callback(bool)` when the private connection comes up or goes down. |
+| `on_login_failed(callback)` | Calls `callback(AuthError)` when the library stops reconnecting because the camera refused the login. |
 | `await get_light()` | `True` only when the light is forced on. `False` in auto mode, even if the lamp is lit. |
 | `await set_light(on)` | `True` forces the light on. `False` returns it to auto, not to forced off. |
 | `await get_light_mode()` | `"infrared"`, `"smart"`, `"color"` or `"custom"`. |
@@ -114,7 +115,7 @@ unsubscribe = camera.subscribe(on_event)
 
 `on_availability` fires with `True` after the login and after each reconnect, and with `False` when the connection drops or `close()` runs. Register it before `connect()` to get the first `True`. A callback cannot be removed.
 
-After a drop the library retries at once, then waits 1 s, doubling the wait up to 60 s. It gives up after 3 refused logins and logs an error. No callback fires for that. Reconnects are logged on the `sannce_aio.connection` logger.
+After a drop the library retries at once, then waits 1 s, doubling the wait up to 60 s. It gives up after 3 refused logins, logs an error and calls each `on_login_failed` callback with the last `AuthError`. The connection then stays down. Reconnects are logged on the `sannce_aio.connection` logger.
 
 The library sends a heartbeat every 3 s but has no silence timeout yet. A camera that stops without closing the TCP connection can stay "available" until the operating system gives up on it. See "Silence timeout" in docs/protocol.md.
 

@@ -9,7 +9,7 @@ import aiohttp
 
 from .audio import SUBFRAME_PCM_BYTES
 from .connection import NvsConnection
-from .errors import SannceError
+from .errors import AuthError, SannceError
 from .events import Event
 from .http import Detection, HttpClient
 from .login import PlaintextLogin
@@ -59,9 +59,11 @@ class SannceCamera:
             PlaintextLogin(host),
             on_event=self._handle_event,
             on_availability=self._handle_availability,
+            on_login_failed=self._handle_login_failed,
         )
         self._subscribers: list[Callable[[Event], None]] = []
         self._availability_subs: list[Callable[[bool], None]] = []
+        self._login_failed_subs: list[Callable[[AuthError], None]] = []
         self._event_timers: dict[tuple[str, int], asyncio.TimerHandle] = {}
         self._info = CameraInfo()
         self._caps: frozenset[str] = frozenset()
@@ -110,6 +112,9 @@ class SannceCamera:
 
     def on_availability(self, callback: Callable[[bool], None]) -> None:
         self._availability_subs.append(callback)
+
+    def on_login_failed(self, callback: Callable[[AuthError], None]) -> None:
+        self._login_failed_subs.append(callback)
 
     async def get_light(self) -> bool:
         return (await self._http.get_light()).on
@@ -211,6 +216,10 @@ class SannceCamera:
     def _handle_availability(self, available: bool) -> None:
         for callback in list(self._availability_subs):
             _safe_call(callback, available, "availability subscriber")
+
+    def _handle_login_failed(self, error: AuthError) -> None:
+        for callback in list(self._login_failed_subs):
+            _safe_call(callback, error, "login failure subscriber")
 
 
 def _check_host(host: str) -> None:
