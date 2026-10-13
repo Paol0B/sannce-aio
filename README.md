@@ -123,17 +123,24 @@ The library sends a heartbeat every 3 s but has no silence timeout yet. A camera
 After `connect()`, `info.firmware` holds the firmware version read over HTTP. `model`, `serial` and `mac` are best-effort. The library fills them only if the camera's device info carries them. The vendor app's own bean has none of the three. Expect `None`. Read them from `discover()`, which takes them from the camera's search reply.
 
 ```python
+import asyncio
+
 from sannce_aio import discover
 
-for found in await discover(timeout=3.0):
-    print(found.ip, found.serial, found.model, found.mac)
+
+async def main() -> None:
+    for found in await discover(timeout=3.0):
+        print(found.ip, found.serial, found.model, found.mac)
+
+
+asyncio.run(main())
 ```
 
 `discover()` returns `list[DiscoveredCamera]` with `ip`, `mac`, `serial`, `model`, `http_port`, `server_port` and `channels`. It sends a UDP multicast search and collects replies for `timeout` seconds. Run it on the camera's LAN.
 
 ### Audio
 
-`play_audio(pcm)` takes an async iterable of `bytes`: 16-bit signed little-endian mono PCM at 8000 Hz, in chunks of any size. The library encodes G.711 A-law and sends 10 ms frames at real-time speed. It ends the talk session when the stream ends, fails or is cancelled. It raises `TalkBusyError` if the camera refuses talk or a talk session is already running.
+`play_audio(pcm)` takes an async iterable of `bytes`: 16-bit signed little-endian mono PCM at 8000 Hz, in chunks of any size. The library encodes G.711 A-law and sends 10 ms frames at real-time speed. It ends the talk session when the stream ends, fails or is cancelled. It raises `TalkBusyError` if the camera refuses talk. Two calls on one `SannceCamera` run one after the other: the second waits for the first.
 
 `play_audio` sends audio to the camera and does not receive any. The camera-side replies are inferred (see Status).
 
@@ -145,7 +152,7 @@ for found in await discover(timeout=3.0):
 | `ConnectError` | The camera is unreachable, a request times out, or the connection is closed or dropped. |
 | `AuthError` | HTTP answers 401 or 403, the camera refuses a login, or the private login does not finish in 10 s. A user name or password over 16 bytes (UTF-8) also raises it. |
 | `ProtocolError` | A reply cannot be parsed, or the camera refuses a write. |
-| `TalkBusyError` | The camera refuses talk, or talk is already running. |
+| `TalkBusyError` | The camera refuses talk. |
 
 Bad arguments raise `ValueError`.
 
@@ -179,17 +186,28 @@ class MyLogin:
 Pass the step to the connection:
 
 ```python
+import asyncio
+
 from sannce_aio.connection import NvsConnection
 
-connection = NvsConnection(
-    "192.168.1.10", 3000, MyLogin(), on_event=print, on_availability=print
-)
-await connection.connect("admin", "PASSWORD")
+
+async def main() -> None:
+    connection = NvsConnection(
+        "192.168.1.10", 3000, MyLogin(), on_event=print, on_availability=print
+    )
+    await connection.connect("admin", "PASSWORD")
+    try:
+        await asyncio.sleep(60)
+    finally:
+        await connection.close()
+
+
+asyncio.run(main())
 ```
 
 `SannceCamera` has no `login` argument yet. It builds its own connection with `PlaintextLogin`.
 
-The encrypted login is documented, not implemented. Some cameras may refuse the plaintext login and ask for a digest login. The spec for it is the "Encrypted login" section of docs/protocol.md on branch `task5-encrypted-login`, which is not merged here. That login needs a second logon message after the camera's first reply, and a step cannot send one yet. On a camera that insists on it, the private login ends in `AuthError`: a timeout or a closed connection. Check 4.1 of the hardware checklist finds out which login the I91FW accepts.
+The encrypted login is documented, not implemented. Some cameras may refuse the plaintext login and ask for a digest login. Its spec lives in a separate branch or module, not in docs/protocol.md here. That login needs a second logon message after the camera's first reply, and a step cannot send one yet. On a camera that insists on it, the private login ends in `AuthError`: a timeout or a closed connection. Check 4.1 of the hardware checklist finds out which login the I91FW accepts.
 
 ## CLI
 
@@ -220,7 +238,7 @@ event: motion clear channel=0
 - The light test ends with the light forced on if it was on before, and in auto mode otherwise. `--no-light` skips it.
 - `--json` prints one JSON object per line, and nothing when `discover` finds no camera. `probe` objects carry a `type`: `info`, `caps`, `light`, `watching` or `event`. `discover` objects hold the camera fields.
 - Defaults: user `admin`, empty password, ports 3000 and 80.
-- Exit code 0 on success, 1 on an error (message on stderr), 130 on Ctrl-C.
+- Exit code 0 on success, 1 on an error (message on stderr), 2 on bad arguments (usage on stderr), 130 on Ctrl-C.
 
 ## Tests
 

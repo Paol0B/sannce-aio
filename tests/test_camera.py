@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import struct
 from urllib.parse import unquote, urlsplit
 
@@ -25,6 +26,11 @@ SUBFRAMES = [
     encode_alaw(PCM[start : start + SUBFRAME_PCM_BYTES])
     for start in range(0, len(PCM), SUBFRAME_PCM_BYTES)
 ]
+OTHER_PCM = struct.pack("<240h", *range(12000, -12000, -100))
+OTHER_SUBFRAMES = [
+    encode_alaw(OTHER_PCM[start : start + SUBFRAME_PCM_BYTES])
+    for start in range(0, len(OTHER_PCM), SUBFRAME_PCM_BYTES)
+]
 
 
 async def wait_until(predicate, timeout=3.0):
@@ -42,17 +48,39 @@ async def async_iter(chunks):
         yield chunk
 
 
+def talk_actions(simulator):
+    return [fields[6] for fields in simulator.requests if fields[1:2] == ["NVR"]]
+
+
+def unused_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def track_closed_sessions(monkeypatch):
+    closed = []
+    close = aiohttp.ClientSession.close
+
+    async def spy(session):
+        closed.append(session)
+        await close(session)
+
+    monkeypatch.setattr(aiohttp.ClientSession, "close", spy)
+    return closed
+
+
 @pytest_asyncio.fixture
 async def make_camera(simulator):
     created = []
 
-    def make(*, username=None, password=None, event_timeout=10.0):
+    def make(*, username=None, password=None, event_timeout=10.0, http_port=None):
         camera = SannceCamera(
             simulator.host,
             simulator.username if username is None else username,
             simulator.password if password is None else password,
             nvs_port=simulator.port,
-            http_port=simulator.http_port,
+            http_port=simulator.http_port if http_port is None else http_port,
             event_timeout=event_timeout,
         )
         created.append(camera)
@@ -129,6 +157,60 @@ async def test_connect_keeps_caller_session_when_nvs_fails(simulator, monkeypatc
         assert session.closed is False
     finally:
         await session.close()
+
+
+async def test_connect_closes_owned_http_session_when_http_fails(
+    make_camera, monkeypatch
+):
+    closed = track_closed_sessions(monkeypatch)
+    camera = make_camera(http_port=unused_port())
+
+    with pytest.raises(ConnectError):
+        await camera.connect()
+
+    assert len(closed) == 1
+
+
+async def test_connect_keeps_caller_session_when_http_fails(simulator):
+    session = aiohttp.ClientSession()
+    try:
+        camera = SannceCamera(
+            simulator.host,
+            simulator.username,
+            simulator.password,
+            nvs_port=simulator.port,
+            http_port=unused_port(),
+            session=session,
+        )
+
+        with pytest.raises(ConnectError):
+            await camera.connect()
+
+        assert session.closed is False
+    finally:
+        await session.close()
+
+
+async def test_connect_cancelled_after_login_closes_the_connection(
+    simulator, make_camera, monkeypatch
+):
+    camera = make_camera()
+    probing = asyncio.Event()
+
+    async def hang(*_args, **_kwargs):
+        probing.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(camera._http, "get_light", hang)
+    task = asyncio.create_task(camera.connect())
+    await asyncio.wait_for(probing.wait(), 5.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await wait_until(lambda: simulator.clients == 0)
+    assert camera._http._session is None
 
 
 async def test_set_light_reaches_the_http_side(simulator, make_camera):
@@ -342,3 +424,43 @@ async def test_play_audio_stops_talk_on_cancel(simulator, make_camera):
         await task
 
     await wait_until(lambda: not simulator.talking)
+
+
+async def test_overlapping_play_audio_calls_run_one_after_the_other(
+    simulator, make_camera
+):
+    camera = make_camera()
+    await camera.connect()
+    streaming = asyncio.Event()
+    release = asyncio.Event()
+
+    async def first():
+        yield PCM[:SUBFRAME_PCM_BYTES]
+        streaming.set()
+        await release.wait()
+        yield PCM[SUBFRAME_PCM_BYTES:]
+
+    one = asyncio.create_task(camera.play_audio(first()))
+    await asyncio.wait_for(streaming.wait(), 5.0)
+    two = asyncio.create_task(camera.play_audio(async_iter([OTHER_PCM])))
+    await asyncio.sleep(0.05)
+    assert not two.done()
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(one, two), 5.0)
+
+    assert simulator.talk_frames == SUBFRAMES + OTHER_SUBFRAMES
+    assert talk_actions(simulator) == ["BEGIN", "END", "BEGIN", "END"]
+    assert not simulator.talking
+
+
+async def test_rejected_play_audio_does_not_end_a_running_talk(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+    await camera._conn.start_talk(0)
+
+    with pytest.raises(TalkBusyError):
+        await camera.play_audio(async_iter([PCM]))
+
+    assert simulator.talking
+    assert talk_actions(simulator) == ["BEGIN"]

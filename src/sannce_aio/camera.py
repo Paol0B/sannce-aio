@@ -65,6 +65,7 @@ class SannceCamera:
         self._event_timers: dict[tuple[str, int], asyncio.TimerHandle] = {}
         self._info = CameraInfo()
         self._caps: frozenset[str] = frozenset()
+        self._play_lock = asyncio.Lock()
 
     @property
     def info(self) -> CameraInfo:
@@ -75,16 +76,16 @@ class SannceCamera:
         return self._caps
 
     async def connect(self) -> None:
-        features = await self._http.get_capabilities()
         try:
+            features = await self._http.get_capabilities()
             await self._conn.connect(self._username, self._password)
+            light_caps = await self._probe_light_caps()
+            self._caps = _build_caps(features, light_caps)
+            self._info = await self._read_info()
         except BaseException:
-            # http.close() only closes a session the facade owns
-            await self._http.close()
+            # the HTTP client only closes a session the facade owns
+            await self.close()
             raise
-        light_caps = await self._probe_light_caps()
-        self._caps = _build_caps(features, light_caps)
-        self._info = await self._read_info()
 
     async def close(self) -> None:
         for timer in self._event_timers.values():
@@ -135,18 +136,19 @@ class SannceCamera:
         await self._http.set_detection(person=person, vehicle=vehicle, motion=motion)
 
     async def play_audio(self, pcm: AsyncIterable[bytes]) -> None:
-        try:
+        async with self._play_lock:
             await self._conn.start_talk(_TALK_CHANNEL)
-            buffer = bytearray()
-            async for chunk in pcm:
-                buffer += chunk
-                await self._stream_frames(buffer)
-            tail = len(buffer) % SUBFRAME_PCM_BYTES
-            if tail:
-                buffer += bytes(SUBFRAME_PCM_BYTES - tail)
-                await self._stream_frames(buffer)
-        finally:
-            await self._stop_talk()
+            try:
+                buffer = bytearray()
+                async for chunk in pcm:
+                    buffer += chunk
+                    await self._stream_frames(buffer)
+                tail = len(buffer) % SUBFRAME_PCM_BYTES
+                if tail:
+                    buffer += bytes(SUBFRAME_PCM_BYTES - tail)
+                    await self._stream_frames(buffer)
+            finally:
+                await self._stop_talk()
 
     async def _stream_frames(self, buffer: bytearray) -> None:
         while len(buffer) >= SUBFRAME_PCM_BYTES:

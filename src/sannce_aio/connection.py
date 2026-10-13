@@ -235,6 +235,9 @@ class NvsConnection:
                 chunk = await asyncio.wait_for(self._reader.read(_READ_SIZE), remaining)
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 raise AuthError("login did not finish before the timeout") from exc
+            # after the timeout clause: TimeoutError is an OSError too
+            except (OSError, ConnectionError) as exc:
+                raise ConnectError(f"cannot read the login reply: {exc}") from exc
             if not chunk:
                 raise AuthError("the camera closed the connection during login")
             buffer += chunk

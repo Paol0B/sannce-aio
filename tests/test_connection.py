@@ -1,4 +1,6 @@
 import asyncio
+import socket
+import struct
 
 import pytest
 
@@ -16,6 +18,12 @@ def event_frame(channel):
     return build_command(fields, 0)
 
 
+def reset(writer):
+    sock = writer.get_extra_info("socket")
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    writer.transport.abort()
+
+
 class ChunkReader:
     def __init__(self, chunks):
         self._chunks = list(chunks)
@@ -27,10 +35,18 @@ class ChunkReader:
 
 
 class FakeCamera:
-    def __init__(self, *, reply_to_requests=True, finish_login=True, reject_reconnect=False):
+    def __init__(
+        self,
+        *,
+        reply_to_requests=True,
+        finish_login=True,
+        reject_reconnect=False,
+        reset_login=False,
+    ):
         self._reply_to_requests = reply_to_requests
         self._finish_login = finish_login
         self._reject_reconnect = reject_reconnect
+        self.reset_login = reset_login
         self._server = None
         self._writer = None
         self._seq = 0
@@ -85,6 +101,9 @@ class FakeCamera:
             self.heartbeats += 1
             return
         if fields[2:4] == ["USER", "LOGON"]:
+            if self.reset_login:
+                reset(writer)
+                return
             await self._send(writer, ["INNER", "CMDID", "7"])
             if self._should_finish_login():
                 await self._send(writer, ["INNER", "LOGON", "FINISHED"])
@@ -268,6 +287,20 @@ async def test_connect_times_out_as_auth_error():
 
 
 @pytest.mark.asyncio
+async def test_connect_reports_a_reset_during_login_as_connect_error():
+    camera = FakeCamera(reset_login=True)
+    await camera.start()
+    conn = make_connection(camera)
+    try:
+        with pytest.raises(ConnectError) as raised:
+            await conn.connect("admin", "admin123")
+        assert isinstance(raised.value.__cause__, ConnectionError)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
 async def test_connect_rejects_oversized_credentials():
     camera = FakeCamera()
     await camera.start()
@@ -302,6 +335,28 @@ async def test_reconnect_gives_up_after_repeated_auth_failure():
         assert availability == [True, False]
         assert conn._available is False
         assert camera.connections == 4
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_keeps_retrying_after_a_reset_during_login():
+    camera = FakeCamera()
+    await camera.start()
+    availability = []
+    conn = make_connection(
+        camera, availability=availability, backoff_start=0.01, backoff_max=0.02
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        camera.reset_login = True
+        await camera.drop_client()
+        await wait_until(lambda: camera.connections >= 3)
+        assert not conn._run_task.done()
+
+        camera.reset_login = False
+        await wait_until(lambda: availability == [True, False, True])
     finally:
         await conn.close()
         await camera.stop()
