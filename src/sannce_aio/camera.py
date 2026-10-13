@@ -3,6 +3,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
+from typing import TypeVar
 from urllib.parse import quote
 
 import aiohttp
@@ -15,6 +16,8 @@ from .http import Detection, HttpClient
 from .login import PlaintextLogin
 
 _log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _TALK_CHANNEL = 0
 # 160 PCM bytes = 80 samples = 10 ms at 8 kHz
@@ -242,13 +245,13 @@ async def _probe(call: Callable[[], Awaitable[object]]) -> bool:
     return True
 
 
-def _safe_call(callback: Callable, arg: object, label: str) -> None:
+def _safe_call(callback: Callable[[_T], None], arg: _T, label: str) -> None:
     try:
         callback(arg)
     except Exception:
         _log.exception("%s raised", label)
 
 
-def _discard(items: list, item: object) -> None:
+def _discard(items: list[_T], item: _T) -> None:
     with contextlib.suppress(ValueError):
         items.remove(item)

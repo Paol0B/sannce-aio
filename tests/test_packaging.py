@@ -99,6 +99,10 @@ def test_wheel_packages_the_source_tree(pyproject):
     assert (LIB / "src" / "sannce_aio" / "__init__.py").is_file()
 
 
+def test_the_package_ships_type_information():
+    assert (LIB / "src" / "sannce_aio" / "py.typed").is_file()
+
+
 def test_readme_is_declared_and_exists(pyproject):
     assert pyproject["project"]["readme"] == "README.md"
     assert README.is_file()
