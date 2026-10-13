@@ -1,12 +1,15 @@
 import asyncio
 import struct
+from urllib.parse import unquote, urlsplit
 
+import aiohttp
 import pytest
 import pytest_asyncio
 
 from sannce_aio import (
     AuthError,
     CameraInfo,
+    ConnectError,
     Event,
     SannceCamera,
     TalkBusyError,
@@ -83,6 +86,51 @@ async def test_connect_bad_credentials_raises_auth_error(make_camera):
         await camera.connect()
 
 
+async def test_connect_closes_owned_http_session_when_nvs_fails(
+    simulator, make_camera, monkeypatch
+):
+    camera = make_camera()
+    captured = {}
+
+    async def fail(*_args, **_kwargs):
+        captured["session"] = camera._http._session
+        raise ConnectError("nvs down")
+
+    monkeypatch.setattr(camera._conn, "connect", fail)
+
+    with pytest.raises(ConnectError):
+        await camera.connect()
+
+    assert captured["session"] is not None
+    assert captured["session"].closed is True
+    assert camera._http._session is None
+
+
+async def test_connect_keeps_caller_session_when_nvs_fails(simulator, monkeypatch):
+    session = aiohttp.ClientSession()
+    try:
+        camera = SannceCamera(
+            simulator.host,
+            simulator.username,
+            simulator.password,
+            nvs_port=simulator.port,
+            http_port=simulator.http_port,
+            session=session,
+        )
+
+        async def fail(*_args, **_kwargs):
+            raise ConnectError("nvs down")
+
+        monkeypatch.setattr(camera._conn, "connect", fail)
+
+        with pytest.raises(ConnectError):
+            await camera.connect()
+
+        assert session.closed is False
+    finally:
+        await session.close()
+
+
 async def test_set_light_reaches_the_http_side(simulator, make_camera):
     camera = make_camera()
     await camera.connect()
@@ -109,6 +157,25 @@ async def test_rtsp_url_rejects_unknown_stream(make_camera):
 
     with pytest.raises(ValueError):
         camera.rtsp_url("high")
+
+
+async def test_rtsp_url_escapes_special_characters(simulator):
+    camera = SannceCamera(
+        simulator.host,
+        "user name",
+        "p@ss:w/rd",
+        nvs_port=simulator.port,
+        http_port=simulator.http_port,
+    )
+
+    parts = urlsplit(camera.rtsp_url("main"))
+
+    assert parts.scheme == "rtsp"
+    assert parts.hostname == simulator.host
+    assert parts.port == 554
+    assert parts.path == "/1/1"
+    assert unquote(parts.username) == "user name"
+    assert unquote(parts.password) == "p@ss:w/rd"
 
 
 @pytest.mark.parametrize("host", ["a/b", "a?b", "a#b", "user@host", ""])
@@ -145,6 +212,20 @@ async def test_event_autoclear_cancelled_by_real_stop(simulator, make_camera):
     assert seen == [Event("motion", True, 0), Event("motion", False, 0)]
     await asyncio.sleep(0.3)
     assert len(seen) == 2
+
+
+async def test_close_cancels_pending_autoclear(simulator, make_camera):
+    camera = make_camera(event_timeout=0.2)
+    await camera.connect()
+    seen = []
+    camera.subscribe(seen.append)
+
+    await simulator.push_event(MOTION_START)
+    await wait_until(lambda: len(seen) == 1)
+    await camera.close()
+    await asyncio.sleep(0.3)
+
+    assert seen == [Event("motion", True, 0)]
 
 
 async def test_unsubscribe_stops_delivery(simulator, make_camera):

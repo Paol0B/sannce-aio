@@ -8,11 +8,13 @@ from .errors import (
     TalkBusyError,
 )
 from .events import Event
+from .http import Detection
 
 __all__ = [
     "AuthError",
     "CameraInfo",
     "ConnectError",
+    "Detection",
     "DiscoveredCamera",
     "Event",
     "ProtocolError",

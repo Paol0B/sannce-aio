@@ -3,6 +3,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import aiohttp
 
@@ -10,7 +11,7 @@ from .audio import SUBFRAME_PCM_BYTES
 from .connection import NvsConnection
 from .errors import SannceError
 from .events import Event
-from .http import HttpClient
+from .http import Detection, HttpClient
 from .login import PlaintextLogin
 
 _log = logging.getLogger(__name__)
@@ -75,7 +76,12 @@ class SannceCamera:
 
     async def connect(self) -> None:
         features = await self._http.get_capabilities()
-        await self._conn.connect(self._username, self._password)
+        try:
+            await self._conn.connect(self._username, self._password)
+        except BaseException:
+            # http.close() only closes a session the facade owns
+            await self._http.close()
+            raise
         light_caps = await self._probe_light_caps()
         self._caps = _build_caps(features, light_caps)
         self._info = await self._read_info()
@@ -92,10 +98,10 @@ class SannceCamera:
             path = _RTSP_PATHS[stream]
         except KeyError:
             raise ValueError(f"stream must be 'main' or 'sub', got {stream!r}") from None
-        return (
-            f"rtsp://{self._username}:{self._password}"
-            f"@{self._host}:{self._rtsp_port}{path}"
-        )
+        user = quote(self._username, safe="")
+        password = quote(self._password, safe="")
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        return f"rtsp://{user}:{password}@{host}:{self._rtsp_port}{path}"
 
     def subscribe(self, callback: Callable[[Event], None]) -> Callable[[], None]:
         self._subscribers.append(callback)
@@ -116,7 +122,7 @@ class SannceCamera:
     async def set_light_mode(self, mode: str) -> None:
         await self._http.set_light_mode(mode)
 
-    async def get_detection(self):
+    async def get_detection(self) -> Detection:
         return await self._http.get_detection()
 
     async def set_detection(
