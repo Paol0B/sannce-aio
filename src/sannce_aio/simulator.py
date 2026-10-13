@@ -22,8 +22,8 @@ _FAILED = "1"
 # one channel: 0 on the private protocol, 1 over HTTP (protocol.md, Channel numbering)
 _TALK_CHANNEL = "0"
 
-_AUDIO_HEAD = b"NVR\x00\t"
-_AUDIO_BODY = b"\t\x00\tNVS\x00"
+# the channel is one raw byte, not a digit (protocol.md, Audio frame layout)
+_AUDIO_PREFIX = b"NVR\x00\t" + bytes([int(_TALK_CHANNEL)]) + b"\t\x00\tNVS\x00"
 _AUDIO_IP_SIZE = 4
 _AUDIO_SUBHEADER_SIZE = 4
 
@@ -111,6 +111,7 @@ class CameraSimulator:
         self.requests: list[list[str]] = []
         self.heartbeats = 0
         self.talk_frames: list[bytes] = []
+        self.talk_seqs: list[int] = []
         self.light_control = 0
         self.light_mode = 1
         self.detection = {"person": True, "vehicle": True, "motion": False}
@@ -194,7 +195,7 @@ class CameraSimulator:
         fields = frame.fields
         if fields is None:
             if session.talking:
-                self._record_audio(frame.payload)
+                self._record_audio(frame)
         elif not fields:
             self.heartbeats += 1
             # the real answer is unknown; any packet resets the SDK idle counter
@@ -226,7 +227,7 @@ class CameraSimulator:
 
     async def _command(self, session: _Session, fields: list[str]) -> None:
         match fields[1:]:
-            case ["NVR", channel, _, "CMD", "TALK", action, *_]:
+            case ["NVR", channel, "", "CMD", "TALK", action, *_]:
                 await self._talk(session, channel, action)
             case [_, *body, session_id] if session_id.isdigit():
                 await self._answer(session, body, session_id)
@@ -256,12 +257,15 @@ class CameraSimulator:
             session.talking = False
             await session.send([*reply, "OK"])
 
-    def _record_audio(self, payload: bytes) -> None:
-        audio = _decode_audio(payload)
+    def _record_audio(self, frame: Frame) -> None:
+        audio = _decode_audio(frame.payload)
         if audio is None:
-            _log.warning("undecodable talk audio packet of %d bytes", len(payload))
+            _log.warning(
+                "undecodable talk audio packet of %d bytes", len(frame.payload)
+            )
         else:
             self.talk_frames.append(audio)
+            self.talk_seqs.append(frame.seq)
 
     def _http_app(self) -> web.Application:
         app = web.Application(middlewares=[self._require_session])
@@ -365,13 +369,10 @@ def _take_frame(buffer: bytearray) -> Frame | None:
 
 
 def _decode_audio(payload: bytes) -> bytes | None:
-    if not payload.startswith(_AUDIO_HEAD):
-        return None
-    body = payload.find(_AUDIO_BODY, len(_AUDIO_HEAD))
-    if body < 0:
+    if not payload.startswith(_AUDIO_PREFIX):
         return None
     # NVS block: byte-swapped device IP, then the sub-header 00 01 <code> 00
-    start = body + len(_AUDIO_BODY) + _AUDIO_IP_SIZE
+    start = len(_AUDIO_PREFIX) + _AUDIO_IP_SIZE
     subheader = payload[start : start + _AUDIO_SUBHEADER_SIZE]
     audio = payload[start + _AUDIO_SUBHEADER_SIZE :]
     if len(subheader) < _AUDIO_SUBHEADER_SIZE or subheader[:2] != b"\x00\x01":

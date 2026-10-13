@@ -473,6 +473,18 @@ async def test_talk_on_another_route_is_not_answered(
     assert not simulator.talking
 
 
+@pytest.mark.parametrize("action", ["BEGIN", "END"])
+async def test_talk_with_a_filled_reserved_field_is_not_answered(
+    simulator, open_raw, action
+):
+    client = await open_raw()
+
+    client.send([DEVICE_IP, "NVR", "0", "x", "CMD", "TALK", action])
+    await client.barrier()
+
+    assert not simulator.talking
+
+
 async def test_talk_audio_is_decoded_while_talking(simulator, open_raw, examples):
     packet = bytes.fromhex(examples["talk_audio_frame_g711a"]["hex"])
     client = await open_raw()
@@ -498,6 +510,19 @@ async def test_talk_audio_from_the_library_framer_is_decoded(simulator, open_raw
         encode_alaw(pcm[start : start + SUBFRAME_PCM_BYTES])
         for start in range(0, len(pcm), SUBFRAME_PCM_BYTES)
     ]
+
+
+async def test_talk_audio_sequence_numbers_are_recorded(simulator, open_raw):
+    pcm = bytes(2 * SUBFRAME_PCM_BYTES)
+    client = await open_raw()
+    client.send([*TALK_REQUEST, "BEGIN"])
+    await client.recv()
+
+    client.send_bytes(frame_talk_audio(pcm, G711A, 5, "10.1.2.3"))
+    client.send_bytes(frame_talk_audio(pcm, G711A, 40, "10.1.2.3"))
+    await client.barrier()
+
+    assert simulator.talk_seqs == [5, 6, 40, 41]
 
 
 async def test_talk_audio_outside_a_talk_is_dropped(simulator, open_raw, examples):
@@ -560,9 +585,44 @@ def break_subheader_end(packet):
     packet[packet.index(b"NVS\x00") + 11] = 0x01
 
 
+def other_channel(packet):
+    packet[packet.index(b"NVS\x00") - 4] = 0x01
+
+
+def ascii_channel(packet):
+    packet[packet.index(b"NVS\x00") - 4] = ord("0")
+
+
+def leading_byte(packet):
+    packet[20:20] = b"\x01"
+    packet[14:16] = len(packet).to_bytes(2, "little")
+
+
+def two_channels(packet):
+    at = packet.index(b"NVS\x00") - 3
+    packet[at:at] = b",\x01"
+    packet[14:16] = len(packet).to_bytes(2, "little")
+
+
+def no_channel(packet):
+    del packet[packet.index(b"NVS\x00") - 4]
+    packet[14:16] = len(packet).to_bytes(2, "little")
+
+
 @pytest.mark.parametrize(
     "damage",
-    [truncate, extend, rename_marker, break_subheader_start, break_subheader_end],
+    [
+        truncate,
+        extend,
+        rename_marker,
+        break_subheader_start,
+        break_subheader_end,
+        other_channel,
+        ascii_channel,
+        two_channels,
+        no_channel,
+        leading_byte,
+    ],
     ids=lambda damage: damage.__name__,
 )
 async def test_malformed_talk_audio_is_dropped(simulator, open_raw, examples, damage):

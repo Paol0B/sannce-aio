@@ -238,6 +238,23 @@ async def test_request_returns_matching_reply():
 
 
 @pytest.mark.asyncio
+async def test_request_times_out_as_connect_error():
+    camera = FakeCamera(reply_to_requests=False)
+    await camera.start()
+    conn = make_connection(camera, heartbeat_interval=1.0, request_timeout=30.0)
+    try:
+        await conn.connect("admin", "admin123")
+        pending = conn.request(
+            [DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0"], timeout=0.2
+        )
+        with pytest.raises(ConnectError, match="no reply within 0.2 seconds"):
+            await asyncio.wait_for(pending, timeout=3.0)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
 async def test_connect_times_out_as_auth_error():
     camera = FakeCamera(finish_login=False)
     await camera.start()
