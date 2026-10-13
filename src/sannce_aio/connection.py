@@ -163,7 +163,7 @@ class NvsConnection:
             try:
                 await self._connect_once()
             except ConnectError as exc:
-                _log.warning("reconnect failed (%s); retrying in %.1fs", exc, delay)
+                _log.debug("reconnect failed (%s); retrying in %.1fs", exc, delay)
             except AuthError as exc:
                 auth_failures += 1
                 if auth_failures >= self._auth_failure_limit:
@@ -175,7 +175,7 @@ class NvsConnection:
                     if self._on_login_failed is not None:
                         self._emit(self._on_login_failed, exc, "login failure")
                     return False
-                _log.warning(
+                _log.debug(
                     "reconnect login failed (%s), attempt %d of %d; retrying in %.1fs",
                     exc,
                     auth_failures,
@@ -183,7 +183,7 @@ class NvsConnection:
                     delay,
                 )
             else:
-                _log.info("reconnected to %s:%d", self._host, self._port)
+                _log.debug("reconnected to %s:%d", self._host, self._port)
                 self._set_available(True)
                 return True
             await asyncio.sleep(delay)

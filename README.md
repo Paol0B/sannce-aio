@@ -115,7 +115,7 @@ unsubscribe = camera.subscribe(on_event)
 
 `on_availability` fires with `True` after the login and after each reconnect, and with `False` when the connection drops or `close()` runs. Register it before `connect()` to get the first `True`. A callback cannot be removed.
 
-After a drop the library retries at once, then waits 1 s, doubling the wait up to 60 s. It gives up after 3 refused logins, logs an error and calls each `on_login_failed` callback with the last `AuthError`. The connection then stays down. Reconnects are logged on the `sannce_aio.connection` logger.
+After a drop the library retries at once, then waits 1 s, doubling the wait up to 60 s. It gives up after 3 refused logins, logs an error and calls each `on_login_failed` callback with the last `AuthError`. The connection then stays down. The retries and the return are logged at debug level on the `sannce_aio.connection` logger, the give-up as an error.
 
 The library sends a heartbeat every 3 s but has no silence timeout yet. A camera that stops without closing the TCP connection can stay "available" until the operating system gives up on it. See "Silence timeout" in docs/protocol.md.
 

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import socket
 import struct
 
@@ -446,3 +447,68 @@ async def test_availability_callback_error_does_not_break_connect():
     finally:
         await conn.close()
         await camera.stop()
+
+
+def connection_log(caplog):
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == "sannce_aio.connection"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retries_and_the_return_log_at_debug(caplog):
+    caplog.set_level(logging.DEBUG, logger="sannce_aio.connection")
+    camera = FakeCamera()
+    await camera.start()
+    availability = []
+    conn = make_connection(
+        camera, availability=availability, backoff_start=0.01, backoff_max=0.02
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        camera.reset_login = True
+        await camera.drop_client()
+        await wait_until(lambda: camera.connections >= 4)
+        camera.reset_login = False
+        await wait_until(lambda: availability == [True, False, True])
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    log = connection_log(caplog)
+    retries = [text for _, text in log if text.startswith("reconnect failed")]
+    assert len(retries) >= 2
+    assert any(text.startswith("reconnected to 127.0.0.1:") for _, text in log)
+    assert {level for level, _ in log} == {logging.DEBUG}
+
+
+@pytest.mark.asyncio
+async def test_refused_reconnect_logins_log_at_debug_until_the_give_up(caplog):
+    caplog.set_level(logging.DEBUG, logger="sannce_aio.connection")
+    camera = FakeCamera(reject_reconnect=True)
+    await camera.start()
+    conn = make_connection(
+        camera,
+        heartbeat_interval=0.05,
+        backoff_start=0.01,
+        backoff_max=0.02,
+        login_timeout=0.1,
+        auth_failure_limit=3,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        await camera.drop_client()
+        await wait_until(lambda: conn._run_task.done(), timeout=5.0)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    log = connection_log(caplog)
+    attempts = [level for level, text in log if text.startswith("reconnect login")]
+    assert attempts == [logging.DEBUG, logging.DEBUG]
+    assert [text for level, text in log if level > logging.DEBUG] == [
+        "giving up reconnect after 3 auth failures: "
+        "login did not finish before the timeout"
+    ]
