@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "sannce-aio"
 version = "0.1.0"
 description = "Asyncio library for SANNCE/Tiandy wired IP cameras on the LAN"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.12"]
 
