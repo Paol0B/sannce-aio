@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
+
+from sannce_aio.simulator import CameraSimulator
 
 EXAMPLES_PATH = Path(__file__).resolve().parents[2] / "docs" / "protocol-examples.json"
 
@@ -21,3 +24,11 @@ def example_bytes(example_id):
 @pytest.fixture
 def examples():
     return load_examples()
+
+
+@pytest_asyncio.fixture
+async def simulator():
+    sim = CameraSimulator()
+    await sim.start()
+    yield sim
+    await sim.stop()
