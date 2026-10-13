@@ -2,14 +2,10 @@ from typing import Any
 
 from aiohttp import web
 
+from .http import AUTO, MANUAL_ON, MODE_NAMES, MODE_VALUES
 from .simulator import CameraSimulator, event_fields
 
 _SIMULATOR = web.AppKey("simulator", CameraSimulator)
-_AUTO = 0
-_MANUAL_ON = 1
-_LIGHT_MODES = {"infrared": 1, "smart": 2, "color": 3}
-# 4 is the vendor app's custom fill: readable, not settable (protocol.md, Light mode)
-_MODE_NAMES = {1: "infrared", 2: "smart", 3: "color", 4: "custom"}
 _DETECTION = ("person", "vehicle", "motion")
 _SETTINGS = {"light", "light_mode", "detection"}
 _MAX_DROP_SECONDS = 3600
@@ -50,8 +46,8 @@ async def _state(request: web.Request) -> web.Response:
     simulator = request.app[_SIMULATOR]
     return web.json_response(
         {
-            "light": simulator.light_control == _MANUAL_ON,
-            "light_mode": _MODE_NAMES.get(simulator.light_mode),
+            "light": simulator.light_control == MANUAL_ON,
+            "light_mode": MODE_NAMES.get(simulator.light_mode),
             "detection": dict(simulator.detection),
             "clients": simulator.clients,
             "talking": simulator.talking,
@@ -78,7 +74,7 @@ async def _settings(request: web.Request) -> web.Response:
     light = _flag(body, "light") if "light" in body else None
     mode = None
     if "light_mode" in body:
-        mode = _LIGHT_MODES.get(_text(body, "light_mode"))
+        mode = MODE_VALUES.get(_text(body, "light_mode"))
         if mode is None:
             raise web.HTTPBadRequest(text="light_mode is infrared, smart or color")
     detection = body.get("detection", {})
@@ -87,7 +83,7 @@ async def _settings(request: web.Request) -> web.Response:
     changes = {name: _flag(detection, name) for name in detection}
     simulator = request.app[_SIMULATOR]
     if light is not None:
-        simulator.light_control = _MANUAL_ON if light else _AUTO
+        simulator.light_control = MANUAL_ON if light else AUTO
     if mode is not None:
         simulator.light_mode = mode
     simulator.detection.update(changes)

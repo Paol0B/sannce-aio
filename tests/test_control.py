@@ -11,7 +11,7 @@ import pytest_asyncio
 from sannce_aio.audio import decode_alaw, encode_alaw
 from sannce_aio.connection import NvsConnection
 from sannce_aio.control import start_control
-from sannce_aio.errors import TalkBusyError
+from sannce_aio.errors import AuthError, TalkBusyError
 from sannce_aio.events import Event
 from sannce_aio.login import PlaintextLogin
 
@@ -63,7 +63,7 @@ async def api(simulator):
 async def connect(simulator):
     made = []
 
-    async def connect_(events=None):
+    async def connect_(events=None, password=None):
         conn = NvsConnection(
             simulator.host,
             simulator.port,
@@ -74,7 +74,7 @@ async def connect(simulator):
             request_timeout=2.0,
         )
         made.append(conn)
-        await conn.connect(simulator.username, simulator.password)
+        await conn.connect(simulator.username, password or simulator.password)
         return conn
 
     yield connect_
@@ -106,6 +106,13 @@ async def test_unknown_event_kind_is_refused(api):
     status, text = await api.post("/event", {"kind": "person", "active": True})
 
     assert (status, text) == (400, "unknown event kind 'person'")
+
+
+@pytest.mark.parametrize("active", ["yes", 1, None])
+async def test_event_active_that_is_not_a_bool_is_refused(api, active):
+    status, text = await api.post("/event", {"kind": "motion", "active": active})
+
+    assert (status, text) == (400, "active is true or false")
 
 
 async def test_settings_change_the_camera(simulator, api):
@@ -157,6 +164,8 @@ async def test_password_holds_for_new_logins(simulator, api, connect):
 
     assert (await api.state())["password"] == "new-pass"
     await connect()
+    with pytest.raises(AuthError):
+        await connect(password="admin123")
 
 
 async def test_drop_refuses_connections_until_reset(simulator, api, connect):

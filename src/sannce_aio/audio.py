@@ -73,8 +73,11 @@ def _alaw_sample(code: int) -> int:
     return value if code & 0x80 else -value
 
 
+_ALAW_SAMPLES = [_alaw_sample(code) for code in range(256)]
+
+
 def decode_alaw(data: bytes) -> bytes:
-    return struct.pack(f"<{len(data)}h", *(_alaw_sample(code) for code in data))
+    return struct.pack(f"<{len(data)}h", *(_ALAW_SAMPLES[code] for code in data))
 
 
 _ENCODERS = {G711A: encode_alaw, G711U: encode_ulaw}

@@ -26,11 +26,11 @@ _PERSON_VEHICLE_MOTION_QUERY = (
     "<subType>00125-MDMotionDetectionSubList</subType></capType></CapDiscription>"
 )
 
-_AUTO = 0
-_MANUAL_ON = 1
-_MODE_VALUES = {"infrared": 1, "smart": 2, "color": 3}
+AUTO = 0
+MANUAL_ON = 1
+MODE_VALUES = {"infrared": 1, "smart": 2, "color": 3}
 # 4 is the user-defined fill: readable, not settable (protocol.md, Light mode)
-_MODE_NAMES = {1: "infrared", 2: "smart", 3: "color", 4: "custom"}
+MODE_NAMES = {1: "infrared", 2: "smart", 3: "color", 4: "custom"}
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class LightState:
 
     @property
     def on(self) -> bool:
-        return self.control == _MANUAL_ON
+        return self.control == MANUAL_ON
 
 
 @dataclass(frozen=True)
@@ -86,24 +86,24 @@ class HttpClient:
         path = _path(_LIGHT, channel)
         state = _light_state(await self._request("GET", path))
         # off returns to auto, not manual off, so smart mode can still light up
-        control = _MANUAL_ON if on else _AUTO
+        control = MANUAL_ON if on else AUTO
         await self._write(path, _light_body(state, control))
 
     async def get_light_mode(self, *, channel: int = 1) -> str:
         raw = await self._request("GET", _path(_MODE, channel))
         value = _int(_parse(raw, "CommonEnable"), "value")
-        if value not in _MODE_NAMES:
+        if value not in MODE_NAMES:
             raise ProtocolError(f"unknown light mode value {value}")
-        return _MODE_NAMES[value]
+        return MODE_NAMES[value]
 
     async def set_light_mode(self, mode: str, *, channel: int = 1) -> None:
-        if mode not in _MODE_VALUES:
+        if mode not in MODE_VALUES:
             raise ValueError(
                 f"light mode must be infrared, color or smart, got {mode!r}"
             )
         body = _xml(
             "CommonEnable",
-            [("enable", "true"), ("type", 4120), ("value", _MODE_VALUES[mode])],
+            [("enable", "true"), ("type", 4120), ("value", MODE_VALUES[mode])],
         )
         await self._write(_path(_MODE, channel), body)
 

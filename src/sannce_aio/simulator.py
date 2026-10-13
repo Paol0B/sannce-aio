@@ -5,15 +5,21 @@ import hashlib
 import io
 import itertools
 import logging
+import re
 import socket
-import struct
 import wave
 import xml.etree.ElementTree as ET
 
 from aiohttp import web
 
 from .audio import decode_alaw
-from .discovery import TARGETS, DiscoveredCamera, build_seek_reply, is_seek_request
+from .discovery import (
+    TARGETS,
+    DiscoveredCamera,
+    build_seek_reply,
+    is_seek_request,
+    join_groups,
+)
 from .errors import ProtocolError
 from .protocol import Frame, build_command, parse_frame
 
@@ -23,8 +29,8 @@ DEFAULT_MODEL = "I91FW-SIM"
 DEFAULT_SERIAL = "SIM0000000001"
 # RFC 7042 documentation address, so it never matches a real device
 DEFAULT_MAC = "00:00:5E:00:53:01"
+MAC_SHAPE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
 SEARCH_PORTS = tuple(sorted({port for _, port in TARGETS}))
-_SEARCH_GROUPS = tuple(sorted({group for group, _ in TARGETS}))
 
 _READ_SIZE = 0x10000
 _SEQ_WRAP = 0x10000
@@ -140,6 +146,9 @@ class _SeekResponder(asyncio.DatagramProtocol):
         self._transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        # a dropped camera is rebooting, so it answers no search either
+        if self._simulator._server is None:
+            return
         if self._transport is not None and is_seek_request(data):
             reply = build_seek_reply(self._simulator.identity())
             self._transport.sendto(reply, addr)
@@ -159,6 +168,8 @@ class CameraSimulator:
         serial: str = DEFAULT_SERIAL,
         mac: str = DEFAULT_MAC,
     ) -> None:
+        if not MAC_SHAPE.fullmatch(mac):
+            raise ValueError(f"{mac!r} is not a MAC like {DEFAULT_MAC}")
         self.host = host
         self.username = username
         self.port = port
@@ -173,6 +184,8 @@ class CameraSimulator:
         self._handlers: set[asyncio.Task] = set()
         self._server: asyncio.Server | None = None
         self._reopen: asyncio.Task[None] | None = None
+        # drop, reset, stop and the reopen await mid-change, so they take turns
+        self._server_lock = asyncio.Lock()
         self._runner: web.AppRunner | None = None
         self._search: list[asyncio.DatagramTransport] = []
         self._http_sessions: set[str] = set()
@@ -225,8 +238,9 @@ class CameraSimulator:
         return self.host, self.port, self.http_port
 
     async def stop(self) -> None:
-        await self._cancel_reopen()
-        await self._close_server()
+        async with self._server_lock:
+            await self._cancel_reopen()
+            await self._close_server()
         for transport in self._search:
             transport.close()
         self._search.clear()
@@ -235,15 +249,17 @@ class CameraSimulator:
             await runner.cleanup()
 
     async def drop(self, seconds: float) -> None:
-        await self._cancel_reopen()
-        await self._close_server()
-        self._http_sessions.clear()
-        self._reopen = asyncio.create_task(self._reopen_after(seconds))
+        async with self._server_lock:
+            await self._cancel_reopen()
+            await self._close_server()
+            self._http_sessions.clear()
+            self._reopen = asyncio.create_task(self._reopen_after(seconds))
 
     async def reset(self) -> None:
-        if await self._cancel_reopen() and self._server is None:
-            await self._open_server()
-        self._restore_start_state()
+        async with self._server_lock:
+            if await self._cancel_reopen() and self._server is None:
+                await self._open_server()
+            self._restore_start_state()
 
     async def push_event(self, fields: list[str]) -> None:
         for session in list(self._sessions):
@@ -281,7 +297,11 @@ class CameraSimulator:
 
     async def _reopen_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
-        await self._open_server()
+        async with self._server_lock:
+            try:
+                await self._open_server()
+            except OSError as exc:
+                _log.warning("cannot reopen port %d after the drop: %s", self.port, exc)
 
     async def _cancel_reopen(self) -> bool:
         reopen, self._reopen = self._reopen, None
@@ -500,13 +520,10 @@ class CameraSimulator:
 def _search_socket(host: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.bind((host, port))
-        for group in _SEARCH_GROUPS:
-            membership = struct.pack("!4sI", socket.inet_aton(group), socket.INADDR_ANY)
-            try:
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
-            except OSError as exc:
-                _log.warning("cannot join %s on UDP %d: %s", group, port, exc)
+        # a socket bound to one address never receives the multicast seek
+        sock.bind(("", port))
+        for group, exc in join_groups(sock, host).items():
+            _log.warning("cannot join %s on UDP %d: %s", group, port, exc)
     except BaseException:
         sock.close()
         raise

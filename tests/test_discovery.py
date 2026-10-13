@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import logging
 import socket
 import struct
@@ -488,6 +489,49 @@ async def test_discover_survives_unreachable_target(
 
     assert await discover(timeout=WAIT) == [camera]
     assert "send failed" in caplog.text
+
+
+class OptionRecorder:
+    def __init__(self, error=None):
+        self.options = []
+        self.error = error
+
+    def setsockopt(self, level, option, value):
+        if self.error is not None:
+            raise self.error
+        self.options.append((level, option, value))
+
+
+def membership(group, interface):
+    value = socket.inet_aton(group) + socket.inet_aton(interface)
+    return (socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, value)
+
+
+def test_join_groups_joins_each_multicast_target_once_on_the_interface(aim):
+    aim(("234.56.78.9", 3000), ("234.56.78.9", 4000), ("192.168.1.10", 3000))
+    sock = OptionRecorder()
+
+    assert discovery.join_groups(sock, "10.0.0.5") == {}
+    assert sock.options == [membership("234.56.78.9", "10.0.0.5")]
+
+
+def test_join_groups_uses_any_interface_by_default():
+    sock = OptionRecorder()
+
+    discovery.join_groups(sock)
+
+    assert sock.options == [
+        membership("234.56.78.9", "0.0.0.0"),
+        membership("239.255.255.250", "0.0.0.0"),
+    ]
+
+
+def test_join_groups_returns_the_groups_it_cannot_join():
+    error = OSError(errno.ENODEV, "No such device")
+
+    failed = discovery.join_groups(OptionRecorder(error))
+
+    assert failed == {"234.56.78.9": error, "239.255.255.250": error}
 
 
 @pytest.mark.asyncio

@@ -252,7 +252,7 @@ python -m sannce_aio simulate [--host HOST] [--nvs-port PORT] [--http-port PORT]
 ```
 
 - Defaults: host `0.0.0.0`, private protocol port 3000, HTTP port 80, control port 8099, user `admin`, password `admin123`, model `I91FW-SIM`, serial `SIM0000000001`, MAC `00:00:5E:00:53:01`.
-- It answers the LAN search on UDP 3000 and 4000 and joins both search groups. `--model`, `--serial` and `--mac` go into that reply.
+- It answers the LAN search on UDP 3000 and 4000, on every address. It joins both search groups on the interface that `--host` names, or on any interface for `0.0.0.0`. `--model`, `--serial` and `--mac` go into that reply.
 - Port 80 needs root outside a container. Docker lets any user bind it inside one.
 - It prints one line when it is ready, then runs until Ctrl-C.
 
@@ -261,11 +261,11 @@ The control API takes and returns JSON over HTTP, with no login. Keep it off unt
 | Request | Effect |
 |---|---|
 | `GET /state` | light, light mode, detection flags, client count, talking, user and password |
-| `POST /event {"kind", "active"}` | push an event: `motion`, `vehicle`, `intrusion`, `line`, `tamper` or `video_loss` |
-| `POST /settings {"light", "light_mode", "detection"}` | change any of them, as the vendor app would. `light` false means auto |
+| `POST /event {"kind", "active"}` | push an event. `kind` is `motion`, `vehicle`, `intrusion`, `line`, `tamper` or `video_loss`. `active` is true or false |
+| `POST /settings {"light", "light_mode", "detection"}` | change any of them, as the vendor app would. `light` is true or false, and false means auto. `light_mode` is `infrared`, `smart` or `color`. `detection` is an object of `person`, `vehicle` and `motion` booleans, each optional |
 | `POST /password {"password"}` | change the password that new logins must use. Open sessions stay |
-| `POST /drop {"seconds"}` | close every session and refuse connections for that long, like a reboot |
-| `POST /talk-busy {"busy"}` | refuse talk requests, as if the app held the channel |
+| `POST /drop {"seconds"}` | refuse connections on the private protocol port only, for `seconds` (0 to 3600), like a reboot. Its open sessions close and HTTP sessions end, but the HTTP port keeps answering. The LAN search gets no answer |
+| `POST /talk-busy {"busy"}` | refuse talk requests while `busy` is true, as if the app held the channel |
 | `GET /audio.wav` | the current or last talk session as 8 kHz mono 16-bit WAV |
 | `POST /reset` | back to the start state |
 

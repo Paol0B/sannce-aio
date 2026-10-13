@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import ipaddress
 import logging
 import socket
@@ -130,11 +129,7 @@ def _open_socket() -> socket.socket:
         # TTL 64 and both groups joined, as the app does (protocol.md, Ports and groups)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, _MULTICAST_TTL)
         _bind(sock)
-        groups = {
-            host for host, _ in TARGETS if ipaddress.ip_address(host).is_multicast
-        }
-        for group in groups:
-            _join(sock, group)
+        join_groups(sock)
     except BaseException:
         sock.close()
         raise
@@ -151,10 +146,16 @@ def _bind(sock: socket.socket) -> None:
         sock.bind(("", 0))
 
 
-def _join(sock: socket.socket, group: str) -> None:
-    membership = struct.pack("!4sI", socket.inet_aton(group), socket.INADDR_ANY)
-    with contextlib.suppress(OSError):
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+def join_groups(sock: socket.socket, interface: str = "0.0.0.0") -> dict[str, OSError]:
+    failed = {}
+    groups = {host for host, _ in TARGETS if ipaddress.ip_address(host).is_multicast}
+    for group in sorted(groups):
+        membership = socket.inet_aton(group) + socket.inet_aton(interface)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        except OSError as exc:
+            failed[group] = exc
+    return failed
 
 
 def _units(body: bytes) -> Iterator[list[str]]:

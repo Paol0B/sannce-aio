@@ -612,12 +612,13 @@ async def test_main_prints_one_error_line_when_a_simulate_port_is_taken(capsys):
     with socket.socket() as holder:
         holder.bind(("127.0.0.1", 0))
         holder.listen()
-        argv = ["simulate", "--host", "127.0.0.1"]
-        argv += ["--nvs-port", str(holder.getsockname()[1])]
+        port = holder.getsockname()[1]
+        argv = ["simulate", "--host", "127.0.0.1", "--nvs-port", str(port)]
 
         code = await asyncio.to_thread(cli.main, argv)
 
     captured = capsys.readouterr()
     assert code == 1
     assert captured.err.startswith("error: ")
+    assert str(port) in captured.err
     assert captured.err.count("\n") == 1

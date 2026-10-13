@@ -1,7 +1,10 @@
 import asyncio
 import contextlib
+import errno
+import gc
 import hashlib
 import io
+import logging
 import socket
 import struct
 import wave
@@ -797,8 +800,8 @@ async def test_client_detection_writes_reach_the_simulator(simulator, client):
     )
 
 
-def free_port(kind=socket.SOCK_STREAM):
-    with socket.socket(socket.AF_INET, kind) as sock:
+def free_port():
+    with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
@@ -884,6 +887,14 @@ async def test_a_taken_port_fails_the_start_and_closes_what_it_opened():
     assert not await connects(sim.host, sim.port)
 
 
+@pytest.mark.parametrize(
+    "mac", ["", "00:00:5E:00:53", "00-00-5E-00-53-01", "00:00:5E:00:53:0G"]
+)
+async def test_a_malformed_mac_is_refused(mac):
+    with pytest.raises(ValueError, match="is not a MAC"):
+        CameraSimulator(mac=mac)
+
+
 async def test_seek_request_gets_the_identity_back_from_the_search_port(
     searchable, seeker
 ):
@@ -926,6 +937,56 @@ async def test_stop_releases_the_search_port(searchable):
         sock.bind((searchable.host, search_port))
 
 
+async def test_the_search_socket_listens_on_every_address(searchable):
+    (transport,) = searchable._search
+
+    assert transport.get_extra_info("sockname")[0] == "0.0.0.0"
+
+
+async def test_the_search_joins_the_groups_on_the_host_interface(monkeypatch):
+    interfaces = []
+
+    def join_groups(sock, interface):
+        interfaces.append(interface)
+        return {}
+
+    monkeypatch.setattr("sannce_aio.simulator.join_groups", join_groups)
+    sim = CameraSimulator(search_ports=(0,))
+    await sim.start()
+    await sim.stop()
+
+    assert interfaces == ["127.0.0.1"]
+
+
+async def test_a_group_the_search_cannot_join_is_logged(monkeypatch, caplog):
+    error = OSError(errno.ENODEV, "No such device")
+    monkeypatch.setattr(
+        "sannce_aio.simulator.join_groups",
+        lambda sock, interface: {"234.56.78.9": error},
+    )
+    sim = CameraSimulator(search_ports=(0,))
+    await sim.start()
+    await sim.stop()
+
+    [message] = caplog.messages
+    assert message.startswith("cannot join 234.56.78.9 on UDP ")
+    assert message.endswith(str(error))
+
+
+async def test_a_dropped_camera_does_not_answer_the_search(searchable, seeker):
+    transport, receiver = seeker
+    (search_port,) = searchable.search_ports
+    await searchable.drop(30)
+
+    transport.sendto(build_seek_request(), (searchable.host, search_port))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(receiver.replies.get(), 0.2)
+    await searchable.reset()
+    transport.sendto(build_seek_request(), (searchable.host, search_port))
+    await asyncio.wait_for(receiver.replies.get(), 2)
+
+
 async def test_drop_closes_sessions_and_refuses_connections(simulator, open_raw):
     client = await open_raw()
 
@@ -938,12 +999,14 @@ async def test_drop_closes_sessions_and_refuses_connections(simulator, open_raw)
 
 
 async def test_drop_ends_the_http_sessions(simulator, http):
+    dropped = http.token
     await simulator.drop(0)
 
     status, _ = await http.call("GET", "/CGI/System/deviceInfo")
 
     assert status == 401
     assert await http.login() == "OK"
+    assert http.token != dropped
 
 
 async def test_connection_returns_after_a_drop_without_a_login_failure(
@@ -973,9 +1036,66 @@ async def test_reset_reopens_a_dropped_camera(simulator):
     assert await connects(simulator.host, simulator.port)
 
 
+async def test_stop_cancels_a_pending_reopen(simulator):
+    await simulator.drop(0.1)
+
+    await simulator.stop()
+    await asyncio.sleep(0.3)
+
+    assert not await connects(simulator.host, simulator.port)
+
+
+async def test_a_failed_reopen_is_logged_and_reset_opens_the_port(simulator, caplog):
+    await simulator.drop(0.1)
+    with socket.socket() as holder:
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind((simulator.host, simulator.port))
+        holder.listen()
+
+        await wait_until(lambda: caplog.records)
+
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert f"[Errno {errno.EADDRINUSE}]" in record.getMessage()
+    await simulator.reset()
+    assert await connects(simulator.host, simulator.port)
+
+
+async def test_two_concurrent_drops_reopen_the_port_once(
+    simulator, open_raw, monkeypatch
+):
+    leaks = []
+    asyncio.get_running_loop().set_exception_handler(
+        lambda _loop, context: leaks.append(context)
+    )
+    opens = 0
+    open_server = simulator._open_server
+
+    async def count_opens():
+        nonlocal opens
+        opens += 1
+        await open_server()
+
+    monkeypatch.setattr(simulator, "_open_server", count_opens)
+    # closing a session makes the first drop wait, so the second one runs meanwhile
+    await open_raw()
+
+    await asyncio.gather(simulator.drop(0.1), simulator.drop(0.2))
+    await wait_until(lambda: opens)
+    await asyncio.sleep(0.3)
+    await simulator.stop()
+    gc.collect()
+
+    assert opens == 1
+    assert leaks == []
+
+
 async def test_reset_restores_the_start_state(simulator, open_raw):
     client = await open_raw()
     await talk(client, bytes(SUBFRAME_PCM_BYTES))
+    await client.barrier()
+    simulator.params["DEVICETYPE"] = ["I91FW"]
+    assert simulator.requests and simulator.heartbeats and simulator.talk_seqs
     simulator.light_control = 1
     simulator.light_mode = 3
     simulator.detection["motion"] = True
@@ -988,6 +1108,8 @@ async def test_reset_restores_the_start_state(simulator, open_raw):
     assert simulator.detection == {"person": True, "vehicle": True, "motion": False}
     assert simulator.password == PASSWORD
     assert simulator.talk_frames == []
+    assert (simulator.requests, simulator.heartbeats) == ([], 0)
+    assert (simulator.params, simulator.talk_seqs) == ({}, [])
     assert wav_frames(simulator.talk_wav()) == b""
     assert simulator.clients == 1
     client.send([*TALK_REQUEST, "BEGIN"])

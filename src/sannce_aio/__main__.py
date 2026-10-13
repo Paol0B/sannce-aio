@@ -3,7 +3,6 @@ import asyncio
 import dataclasses
 import json
 import os
-import re
 import sys
 from collections.abc import Callable
 from typing import TextIO
@@ -17,6 +16,7 @@ from .simulator import (
     DEFAULT_MAC,
     DEFAULT_MODEL,
     DEFAULT_SERIAL,
+    MAC_SHAPE,
     SEARCH_PORTS,
     CameraSimulator,
 )
@@ -24,7 +24,6 @@ from .simulator import (
 _EXIT_FAILED = 1
 _EXIT_INTERRUPTED = 130
 _MAX_PORT = 65535
-_MAC_SHAPE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
 
 _Emit = Callable[[dict | None, str], None]
 
@@ -277,7 +276,7 @@ def _port(text: str) -> int:
 
 
 def _mac(text: str) -> str:
-    if not _MAC_SHAPE.fullmatch(text):
+    if not MAC_SHAPE.fullmatch(text):
         raise argparse.ArgumentTypeError(f"{text!r} is not a MAC like {DEFAULT_MAC}")
     return text
 
