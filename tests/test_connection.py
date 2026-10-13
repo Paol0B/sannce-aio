@@ -27,9 +27,10 @@ class ChunkReader:
 
 
 class FakeCamera:
-    def __init__(self, *, reply_to_requests=True, finish_login=True):
+    def __init__(self, *, reply_to_requests=True, finish_login=True, reject_reconnect=False):
         self._reply_to_requests = reply_to_requests
         self._finish_login = finish_login
+        self._reject_reconnect = reject_reconnect
         self._server = None
         self._writer = None
         self._seq = 0
@@ -85,7 +86,7 @@ class FakeCamera:
             return
         if fields[2:4] == ["USER", "LOGON"]:
             await self._send(writer, ["INNER", "CMDID", "7"])
-            if self._finish_login:
+            if self._should_finish_login():
                 await self._send(writer, ["INNER", "LOGON", "FINISHED"])
             return
         self.requests.append(fields)
@@ -93,6 +94,17 @@ class FakeCamera:
             session_id = fields[-1]
             reply = ["INNER", "CMD", "GETPARAM", "FINISHED", session_id, "0"]
             await self._send(writer, reply)
+
+    def _should_finish_login(self):
+        if not self._finish_login:
+            return False
+        # reconnect attempts never finish, so the client times out into AuthError
+        return not (self._reject_reconnect and self.connections > 1)
+
+    async def push_event(self, channel):
+        writer = self._writer
+        if writer is not None:
+            await self._send(writer, ["INNER", "ALARM", "MOTIONDETECT", str(channel), "1"])
 
     async def _send(self, writer, inner):
         writer.write(build_command([DEVICE_IP, "IP", *inner], self._seq))
@@ -246,6 +258,94 @@ async def test_connect_rejects_oversized_credentials():
     try:
         with pytest.raises(AuthError):
             await conn.connect("admin", "x" * 17)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_gives_up_after_repeated_auth_failure():
+    camera = FakeCamera(reject_reconnect=True)
+    await camera.start()
+    availability = []
+    conn = make_connection(
+        camera,
+        availability=availability,
+        heartbeat_interval=0.05,
+        backoff_start=0.01,
+        backoff_max=0.02,
+        login_timeout=0.1,
+        auth_failure_limit=3,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        assert availability == [True]
+        await camera.drop_client()
+        await wait_until(lambda: conn._run_task.done(), timeout=5.0)
+        assert availability == [True, False]
+        assert conn._available is False
+        assert camera.connections == 4
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
+async def test_event_callback_error_does_not_kill_receive_loop():
+    camera = FakeCamera()
+    await camera.start()
+    received = []
+    availability = []
+
+    def on_event(event):
+        received.append(event)
+        raise RuntimeError("callback boom")
+
+    conn = NvsConnection(
+        "127.0.0.1",
+        camera.port,
+        PlaintextLogin(DEVICE_IP),
+        on_event=on_event,
+        on_availability=availability.append,
+        heartbeat_interval=0.05,
+        backoff_start=0.01,
+        backoff_max=0.05,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        await camera.push_event(0)
+        await wait_until(lambda: len(received) == 1)
+        await camera.push_event(1)
+        await wait_until(lambda: len(received) == 2)
+        assert received == [Event("motion", True, 0), Event("motion", True, 1)]
+        await camera.drop_client()
+        await wait_until(lambda: availability == [True, False, True])
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+@pytest.mark.asyncio
+async def test_availability_callback_error_does_not_break_connect():
+    camera = FakeCamera()
+    await camera.start()
+
+    def on_availability(_state):
+        raise RuntimeError("availability boom")
+
+    conn = NvsConnection(
+        "127.0.0.1",
+        camera.port,
+        PlaintextLogin(DEVICE_IP),
+        on_event=lambda _event: None,
+        on_availability=on_availability,
+        heartbeat_interval=1.0,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        assert conn._available is True
+        reply = await conn.request([DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0"])
+        assert reply[2:6] == ["INNER", "CMD", "GETPARAM", "FINISHED"]
     finally:
         await conn.close()
         await camera.stop()

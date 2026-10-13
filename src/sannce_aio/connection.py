@@ -1,10 +1,13 @@
 import asyncio
+import logging
 from collections.abc import Callable
 
 from .errors import AuthError, ConnectError, ProtocolError
 from .events import Event, parse_event
 from .login import LoginStep
 from .protocol import Frame, build_command, parse_frame
+
+_log = logging.getLogger(__name__)
 
 _READ_SIZE = 0x10000
 _MAX_BUFFER = 0x10000
@@ -29,6 +32,7 @@ class NvsConnection:
         login_timeout: float = 10.0,
         backoff_start: float = 1.0,
         backoff_max: float = 60.0,
+        auth_failure_limit: int = 3,
     ) -> None:
         self._host = host
         self._port = port
@@ -40,6 +44,7 @@ class NvsConnection:
         self._login_timeout = login_timeout
         self._backoff_start = backoff_start
         self._backoff_max = backoff_max
+        self._auth_failure_limit = auth_failure_limit
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._rx_buffer = bytearray()
@@ -105,19 +110,40 @@ class NvsConnection:
             self._set_available(False)
             self._fail_pending(ConnectError("connection dropped"))
             await self._close_transport()
-            await self._reconnect()
+            if not await self._reconnect():
+                break
 
-    async def _reconnect(self) -> None:
+    async def _reconnect(self) -> bool:
         delay = self._backoff_start
+        auth_failures = 0
         while not self._closing:
             try:
                 await self._connect_once()
-            except (ConnectError, AuthError):
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, self._backoff_max)
-                continue
-            self._set_available(True)
-            return
+            except ConnectError as exc:
+                _log.warning("reconnect failed (%s); retrying in %.1fs", exc, delay)
+            except AuthError as exc:
+                auth_failures += 1
+                if auth_failures >= self._auth_failure_limit:
+                    _log.error(
+                        "giving up reconnect after %d auth failures: %s",
+                        auth_failures,
+                        exc,
+                    )
+                    return False
+                _log.warning(
+                    "reconnect login failed (%s), attempt %d of %d; retrying in %.1fs",
+                    exc,
+                    auth_failures,
+                    self._auth_failure_limit,
+                    delay,
+                )
+            else:
+                _log.info("reconnected to %s:%d", self._host, self._port)
+                self._set_available(True)
+                return True
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self._backoff_max)
+        return False
 
     async def _connect_once(self) -> None:
         try:
@@ -129,7 +155,11 @@ class NvsConnection:
         self._rx_buffer = bytearray()
         self._seq = 0
         self._session_id = 1
-        await self._login_exchange()
+        try:
+            await self._login_exchange()
+        except BaseException:
+            await self._close_transport()
+            raise
 
     async def _login_exchange(self) -> None:
         try:
@@ -211,7 +241,7 @@ class NvsConnection:
         if fields[2:4] == _ALARM_HEAD:
             event = parse_event(fields)
             if event is not None:
-                self._on_event(event)
+                self._emit(self._on_event, event, "event")
             return
         session_id = _reply_session_id(fields)
         if session_id is None:
@@ -230,7 +260,14 @@ class NvsConnection:
         if state == self._available:
             return
         self._available = state
-        self._on_availability(state)
+        self._emit(self._on_availability, state, "availability")
+
+    def _emit(self, callback: Callable, arg: object, label: str) -> None:
+        # a raising callback must not kill the receive loop or supervisor
+        try:
+            callback(arg)
+        except Exception:
+            _log.exception("%s callback raised", label)
 
     async def _close_transport(self) -> None:
         writer = self._writer
@@ -290,5 +327,7 @@ async def _cancel(task: asyncio.Task) -> None:
     task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError:
         pass
+    except Exception:
+        _log.exception("background task failed")
