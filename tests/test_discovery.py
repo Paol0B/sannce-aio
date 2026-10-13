@@ -11,8 +11,10 @@ import pytest_asyncio
 from sannce_aio import discovery
 from sannce_aio.discovery import (
     DiscoveredCamera,
+    build_seek_reply,
     build_seek_request,
     discover,
+    is_seek_request,
     parse_discovery_reply,
 )
 from sannce_aio.errors import ProtocolError
@@ -241,6 +243,35 @@ def test_parse_rejects_bad_datagram(examples, reply_fields, case):
 
     with pytest.raises(ProtocolError):
         parse_discovery_reply(bad)
+
+
+def test_seek_reply_round_trips(camera):
+    assert parse_discovery_reply(build_seek_reply(camera)) == camera
+
+
+def test_seek_reply_puts_each_field_where_the_example_has_it(camera, reply_fields):
+    payload = build_seek_reply(camera)[10:].decode()
+    fields = payload.removesuffix("\n\n\n").split("\t")[1:]
+
+    assert len(fields) == len(reply_fields)
+    for index in (0, 1, 2, 6, 7, 10, 22, 24, 32):
+        assert fields[index] == reply_fields[index]
+
+
+def test_seek_reply_without_an_ip_reads_the_source_address(camera):
+    reply = build_seek_reply(dataclasses.replace(camera, ip=""))
+
+    assert parse_discovery_reply(reply, "10.0.0.5").ip == "10.0.0.5"
+
+
+def test_seek_request_is_recognised(examples):
+    request = raw(examples, REQUEST)
+
+    assert is_seek_request(request)
+    assert not is_seek_request(raw(examples, REPLY))
+    assert not is_seek_request(request[:9])
+    assert not is_seek_request(b"\x00" + request[1:])
+    assert not is_seek_request(datagram(["CMD", "OTHER"]))
 
 
 class Responder(asyncio.DatagramProtocol):

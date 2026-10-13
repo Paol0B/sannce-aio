@@ -54,6 +54,29 @@ def build_seek_request() -> bytes:
     return _ENVELOPE.pack(_MAGIC, 0, 0, len(payload)) + payload
 
 
+def is_seek_request(datagram: bytes) -> bool:
+    if len(datagram) < _ENVELOPE.size or _ENVELOPE.unpack_from(datagram)[0] != _MAGIC:
+        return False
+    return any(
+        fields[:2] == ["CMD", "SEEKNVSS"]
+        for fields in _units(datagram[_ENVELOPE.size :])
+    )
+
+
+def build_seek_reply(camera: DiscoveredCamera) -> bytes:
+    fields = [""] * (_IP + 1)
+    fields[:2] = ["CMD", "NVSS"]
+    fields[_MAC] = _reverse_mac(camera.mac)
+    fields[_CHANNELS] = str(camera.channels)
+    fields[_SERVER_PORT] = str(camera.server_port)
+    fields[_HTTP_PORT] = str(camera.http_port)
+    fields[_MODEL] = camera.model
+    fields[_SERIAL] = camera.serial
+    fields[_IP] = camera.ip
+    payload = encode_fields([_PROTOCOL, *fields])
+    return _ENVELOPE.pack(_MAGIC, 0, 0, len(payload)) + payload
+
+
 def parse_discovery_reply(datagram: bytes, source_ip: str = "") -> DiscoveredCamera:
     if len(datagram) < _ENVELOPE.size:
         raise ProtocolError(

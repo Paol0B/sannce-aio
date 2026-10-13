@@ -1,21 +1,35 @@
 import asyncio
 import contextlib
 import hashlib
+import io
+import socket
 import struct
+import wave
 import xml.etree.ElementTree as ET
 
 import aiohttp
 import pytest
 import pytest_asyncio
 
-from sannce_aio.audio import G711A, SUBFRAME_PCM_BYTES, encode_alaw, frame_talk_audio
+from sannce_aio.audio import (
+    G711A,
+    SUBFRAME_PCM_BYTES,
+    decode_alaw,
+    encode_alaw,
+    frame_talk_audio,
+)
 from sannce_aio.connection import NvsConnection
+from sannce_aio.discovery import (
+    DiscoveredCamera,
+    build_seek_request,
+    parse_discovery_reply,
+)
 from sannce_aio.errors import AuthError
-from sannce_aio.events import Event
+from sannce_aio.events import Event, parse_event
 from sannce_aio.http import Detection, HttpClient
 from sannce_aio.login import PlaintextLogin
 from sannce_aio.protocol import build_command, parse_frame
-from sannce_aio.simulator import CameraSimulator
+from sannce_aio.simulator import CameraSimulator, event_fields
 
 pytestmark = pytest.mark.asyncio
 
@@ -781,3 +795,265 @@ async def test_client_detection_writes_reach_the_simulator(simulator, client):
     assert await client.get_detection() == Detection(
         person=False, vehicle=True, motion=True
     )
+
+
+def free_port(kind=socket.SOCK_STREAM):
+    with socket.socket(socket.AF_INET, kind) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def connects(host, port):
+    try:
+        _, writer = await asyncio.open_connection(host, port)
+    except OSError:
+        return False
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+    return True
+
+
+def wav_frames(data):
+    with wave.open(io.BytesIO(data)) as wav:
+        assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) == (
+            1,
+            2,
+            8000,
+        )
+        return wav.readframes(wav.getnframes())
+
+
+async def talk(client, pcm):
+    client.send([*TALK_REQUEST, "BEGIN"])
+    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
+    client.send_bytes(frame_talk_audio(pcm, G711A, 0, "10.1.2.3"))
+    client.send([*TALK_REQUEST, "END"])
+    assert await client.recv() == [*TALK_REPLY, "END", "OK"]
+
+
+class SeekReceiver(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.replies = asyncio.Queue()
+
+    def datagram_received(self, data, addr):
+        self.replies.put_nowait((data, addr))
+
+
+@pytest_asyncio.fixture
+async def searchable():
+    sim = CameraSimulator(
+        search_ports=(0,),
+        model="CAM-SIM",
+        serial="SN-SIM",
+        mac="00:00:5E:00:53:99",
+    )
+    await sim.start()
+    yield sim
+    await sim.stop()
+
+
+@pytest_asyncio.fixture
+async def seeker():
+    loop = asyncio.get_running_loop()
+    transport, receiver = await loop.create_datagram_endpoint(
+        SeekReceiver, local_addr=("127.0.0.1", 0)
+    )
+    yield transport, receiver
+    transport.close()
+
+
+async def test_fixed_ports_are_used():
+    nvs, http = free_port(), free_port()
+    sim = CameraSimulator(port=nvs, http_port=http)
+    try:
+        assert await sim.start() == ("127.0.0.1", nvs, http)
+    finally:
+        await sim.stop()
+
+
+async def test_a_taken_port_fails_the_start_and_closes_what_it_opened():
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        sim = CameraSimulator(port=free_port(), http_port=holder.getsockname()[1])
+
+        with pytest.raises(OSError):
+            await sim.start()
+
+    assert not await connects(sim.host, sim.port)
+
+
+async def test_seek_request_gets_the_identity_back_from_the_search_port(
+    searchable, seeker
+):
+    transport, receiver = seeker
+    (search_port,) = searchable.search_ports
+
+    transport.sendto(build_seek_request(), (searchable.host, search_port))
+
+    data, source = await asyncio.wait_for(receiver.replies.get(), 2)
+    assert source == (searchable.host, search_port)
+    assert parse_discovery_reply(data, source[0]) == DiscoveredCamera(
+        ip="127.0.0.1",
+        mac="00:00:5E:00:53:99",
+        serial="SN-SIM",
+        model="CAM-SIM",
+        http_port=searchable.http_port,
+        server_port=searchable.port,
+        channels=1,
+    )
+
+
+async def test_other_datagrams_get_no_reply(searchable, seeker):
+    transport, receiver = seeker
+    (search_port,) = searchable.search_ports
+
+    transport.sendto(b"hello", (searchable.host, search_port))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(receiver.replies.get(), 0.2)
+    transport.sendto(build_seek_request(), (searchable.host, search_port))
+    await asyncio.wait_for(receiver.replies.get(), 2)
+
+
+async def test_stop_releases_the_search_port(searchable):
+    (search_port,) = searchable.search_ports
+
+    await searchable.stop()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind((searchable.host, search_port))
+
+
+async def test_drop_closes_sessions_and_refuses_connections(simulator, open_raw):
+    client = await open_raw()
+
+    await simulator.drop(30)
+
+    assert await client.recv() is None
+    assert simulator.clients == 0
+    with pytest.raises(ConnectionRefusedError):
+        await asyncio.open_connection(simulator.host, simulator.port)
+
+
+async def test_drop_ends_the_http_sessions(simulator, http):
+    await simulator.drop(0)
+
+    status, _ = await http.call("GET", "/CGI/System/deviceInfo")
+
+    assert status == 401
+    assert await http.login() == "OK"
+
+
+async def test_connection_returns_after_a_drop_without_a_login_failure(
+    simulator, make_connection
+):
+    availability = []
+    failures = []
+    conn = make_connection(
+        availability=availability,
+        backoff_start=0.05,
+        on_login_failed=failures.append,
+    )
+    await conn.connect(USER, PASSWORD)
+
+    await simulator.drop(0.3)
+
+    await wait_until(lambda: availability == [True, False, True])
+    assert failures == []
+    assert simulator.clients == 1
+
+
+async def test_reset_reopens_a_dropped_camera(simulator):
+    await simulator.drop(30)
+
+    await simulator.reset()
+
+    assert await connects(simulator.host, simulator.port)
+
+
+async def test_reset_restores_the_start_state(simulator, open_raw):
+    client = await open_raw()
+    await talk(client, bytes(SUBFRAME_PCM_BYTES))
+    simulator.light_control = 1
+    simulator.light_mode = 3
+    simulator.detection["motion"] = True
+    simulator.password = "changed"
+    simulator.set_talk_busy(True)
+
+    await simulator.reset()
+
+    assert (simulator.light_control, simulator.light_mode) == (0, 1)
+    assert simulator.detection == {"person": True, "vehicle": True, "motion": False}
+    assert simulator.password == PASSWORD
+    assert simulator.talk_frames == []
+    assert wav_frames(simulator.talk_wav()) == b""
+    assert simulator.clients == 1
+    client.send([*TALK_REQUEST, "BEGIN"])
+    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
+
+
+async def test_a_new_password_holds_for_new_logins_only(
+    simulator, make_connection, open_raw
+):
+    logged_in = await open_raw()
+
+    simulator.password = "changed"
+
+    await logged_in.barrier()
+    with pytest.raises(AuthError):
+        await make_connection(login_timeout=0.5).connect(USER, PASSWORD)
+    await make_connection().connect(USER, "changed")
+
+
+async def test_talk_wav_is_empty_before_any_talk(simulator):
+    assert wav_frames(simulator.talk_wav()) == b""
+
+
+async def test_talk_wav_holds_only_the_last_session(simulator, open_raw):
+    first = struct.pack("<160h", *range(-8000, 8000, 100))
+    last = struct.pack("<80h", *([1000] * 80))
+    client = await open_raw()
+
+    await talk(client, first)
+    await talk(client, last)
+
+    assert wav_frames(simulator.talk_wav()) == decode_alaw(encode_alaw(last))
+
+
+async def test_talk_wav_grows_while_the_session_runs(simulator, open_raw):
+    client = await open_raw()
+    client.send([*TALK_REQUEST, "BEGIN"])
+    await client.recv()
+
+    client.send_bytes(frame_talk_audio(bytes(SUBFRAME_PCM_BYTES), G711A, 0, "10.1.2.3"))
+    await client.barrier()
+
+    assert len(wav_frames(simulator.talk_wav())) == SUBFRAME_PCM_BYTES
+
+
+@pytest.mark.parametrize(
+    ("kind", "example_id"),
+    [
+        ("motion", "event_motion_start"),
+        ("vehicle", "event_smart_vehicle"),
+        ("intrusion", "event_vca_intrusion"),
+        ("tamper", "event_video_cover"),
+    ],
+)
+async def test_event_fields_match_the_documented_start(examples, kind, example_id):
+    assert camera(*event_fields(kind, True)) == fields_of(examples, example_id)
+
+
+@pytest.mark.parametrize(
+    "kind", ["motion", "vehicle", "intrusion", "line", "tamper", "video_loss"]
+)
+@pytest.mark.parametrize("active", [True, False])
+async def test_event_fields_parse_back_to_the_kind(kind, active):
+    assert parse_event(camera(*event_fields(kind, active))) == Event(kind, active, 0)
+
+
+async def test_event_fields_reject_an_unknown_kind():
+    with pytest.raises(ValueError, match="person"):
+        event_fields("person", True)

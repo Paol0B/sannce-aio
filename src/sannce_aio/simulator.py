@@ -2,15 +2,29 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import io
+import itertools
 import logging
+import socket
+import struct
+import wave
 import xml.etree.ElementTree as ET
 
 from aiohttp import web
 
+from .audio import decode_alaw
+from .discovery import TARGETS, DiscoveredCamera, build_seek_reply, is_seek_request
 from .errors import ProtocolError
 from .protocol import Frame, build_command, parse_frame
 
 _log = logging.getLogger(__name__)
+
+DEFAULT_MODEL = "I91FW-SIM"
+DEFAULT_SERIAL = "SIM0000000001"
+# RFC 7042 documentation address, so it never matches a real device
+DEFAULT_MAC = "00:00:5E:00:53:01"
+SEARCH_PORTS = tuple(sorted({port for _, port in TARGETS}))
+_SEARCH_GROUPS = tuple(sorted({group for group, _ in TARGETS}))
 
 _READ_SIZE = 0x10000
 _SEQ_WRAP = 0x10000
@@ -21,11 +35,24 @@ _OK = "0"
 _FAILED = "1"
 # one channel: 0 on the private protocol, 1 over HTTP (protocol.md, Channel numbering)
 _TALK_CHANNEL = "0"
+_TALK_RATE = 8000
 
 # the channel is one raw byte, not a digit (protocol.md, Audio frame layout)
 _AUDIO_PREFIX = b"NVR\x00\t" + bytes([int(_TALK_CHANNEL)]) + b"\t\x00\tNVS\x00"
 _AUDIO_IP_SIZE = 4
 _AUDIO_SUBHEADER_SIZE = 4
+
+_EVENT_CHANNEL = "0"
+_EVENT_NAMES = {
+    "motion": "MOTIONDETECT",
+    "vehicle": "MOTIONDETECT_CAR",
+    "tamper": "VIDEOCOVER",
+    "video_loss": "VIDEOLOST",
+}
+# VCA A4 rule values (protocol.md, Message to library kind)
+_VCA_RULES = {"line": "0", "intrusion": "2"}
+# A5 onward, no targets and no rules (protocol.md, Event messages and their fields)
+_VCA_TAIL = ["0", "0", "0:0:0:0", "0", "0", "0,0,0,0,0,0,0", "0", "0", "0", "", ""]
 
 _SESSION_CHECK = "/CGI/Security/SessionCheck"
 _LOGON = "/CGI/Security/Logon"
@@ -78,6 +105,16 @@ _WRITE_OK = (
 )
 
 
+def event_fields(kind: str, active: bool) -> list[str]:
+    state = "1" if active else "0"
+    if kind in _EVENT_NAMES:
+        return ["INNER", "ALARM", _EVENT_NAMES[kind], _EVENT_CHANNEL, state]
+    if kind in _VCA_RULES:
+        rule = _VCA_RULES[kind]
+        return ["INNER", "ALARM", "VCA", _EVENT_CHANNEL, state, "0", rule, *_VCA_TAIL]
+    raise ValueError(f"unknown event kind {kind!r}")
+
+
 class _Session:
     def __init__(self, writer: asyncio.StreamWriter) -> None:
         self.writer = writer
@@ -94,6 +131,20 @@ class _Session:
             await self.writer.drain()
 
 
+class _SeekResponder(asyncio.DatagramProtocol):
+    def __init__(self, simulator: "CameraSimulator") -> None:
+        self._simulator = simulator
+        self._transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self._transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if self._transport is not None and is_seek_request(data):
+            reply = build_seek_reply(self._simulator.identity())
+            self._transport.sendto(reply, addr)
+
+
 class CameraSimulator:
     def __init__(
         self,
@@ -101,12 +152,34 @@ class CameraSimulator:
         host: str = "127.0.0.1",
         username: str = "admin",
         password: str = "admin123",
+        port: int = 0,
+        http_port: int = 0,
+        search_ports: tuple[int, ...] = (),
+        model: str = DEFAULT_MODEL,
+        serial: str = DEFAULT_SERIAL,
+        mac: str = DEFAULT_MAC,
     ) -> None:
         self.host = host
         self.username = username
-        self.password = password
-        self.port = 0
-        self.http_port = 0
+        self.port = port
+        self.http_port = http_port
+        self.search_ports = search_ports
+        self.model = model
+        self.serial = serial
+        self.mac = mac
+        self._start_password = password
+        self._restore_start_state()
+        self._sessions: set[_Session] = set()
+        self._handlers: set[asyncio.Task] = set()
+        self._server: asyncio.Server | None = None
+        self._reopen: asyncio.Task[None] | None = None
+        self._runner: web.AppRunner | None = None
+        self._search: list[asyncio.DatagramTransport] = []
+        self._http_sessions: set[str] = set()
+        self._http_session_ids = itertools.count(1)
+
+    def _restore_start_state(self) -> None:
+        self.password = self._start_password
         self.params: dict[str, list[str]] = {}
         self.requests: list[list[str]] = []
         self.heartbeats = 0
@@ -116,11 +189,7 @@ class CameraSimulator:
         self.light_mode = 1
         self.detection = {"person": True, "vehicle": True, "motion": False}
         self._talk_busy = False
-        self._sessions: set[_Session] = set()
-        self._handlers: set[asyncio.Task] = set()
-        self._server: asyncio.Server | None = None
-        self._runner: web.AppRunner | None = None
-        self._http_sessions: set[str] = set()
+        self._talk_audio: list[bytes] = []
 
     @property
     def clients(self) -> int:
@@ -130,31 +199,51 @@ class CameraSimulator:
     def talking(self) -> bool:
         return any(session.talking for session in self._sessions)
 
+    def identity(self) -> DiscoveredCamera:
+        # no ip: the client takes the reply's source address (protocol.md, Seek reply)
+        return DiscoveredCamera(
+            ip="",
+            mac=self.mac,
+            serial=self.serial,
+            model=self.model,
+            http_port=self.http_port,
+            server_port=self.port,
+            channels=1,
+        )
+
     async def start(self) -> tuple[str, int, int]:
         try:
-            self._server = await asyncio.start_server(self._handle, self.host, 0)
-            self.port = self._server.sockets[0].getsockname()[1]
+            await self._open_server()
             self._runner = web.AppRunner(self._http_app(), access_log=None)
             await self._runner.setup()
-            await web.TCPSite(self._runner, self.host, 0).start()
+            await web.TCPSite(self._runner, self.host, self.http_port).start()
             self.http_port = self._runner.addresses[0][1]
+            await self._open_search()
         except BaseException:
             await self.stop()
             raise
         return self.host, self.port, self.http_port
 
     async def stop(self) -> None:
-        server, self._server = self._server, None
+        await self._cancel_reopen()
+        await self._close_server()
+        for transport in self._search:
+            transport.close()
+        self._search.clear()
         runner, self._runner = self._runner, None
-        if server is not None:
-            server.close()
-            for session in list(self._sessions):
-                session.writer.close()
-            # wait_closed() ignores open connections before Python 3.12.1
-            await asyncio.gather(*self._handlers, return_exceptions=True)
-            await server.wait_closed()
         if runner is not None:
             await runner.cleanup()
+
+    async def drop(self, seconds: float) -> None:
+        await self._cancel_reopen()
+        await self._close_server()
+        self._http_sessions.clear()
+        self._reopen = asyncio.create_task(self._reopen_after(seconds))
+
+    async def reset(self) -> None:
+        if await self._cancel_reopen() and self._server is None:
+            await self._open_server()
+        self._restore_start_state()
 
     async def push_event(self, fields: list[str]) -> None:
         for session in list(self._sessions):
@@ -164,6 +253,54 @@ class CameraSimulator:
 
     def set_talk_busy(self, busy: bool) -> None:
         self._talk_busy = busy
+
+    def talk_wav(self) -> bytes:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(_TALK_RATE)
+            # the library talks G.711 A-law only (connection._TALK_CODEC)
+            wav.writeframes(decode_alaw(b"".join(self._talk_audio)))
+        return output.getvalue()
+
+    async def _open_server(self) -> None:
+        self._server = await asyncio.start_server(self._handle, self.host, self.port)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def _close_server(self) -> None:
+        server, self._server = self._server, None
+        if server is None:
+            return
+        server.close()
+        for session in list(self._sessions):
+            session.writer.close()
+        # wait_closed() ignores open connections before Python 3.12.1
+        await asyncio.gather(*self._handlers, return_exceptions=True)
+        await server.wait_closed()
+
+    async def _reopen_after(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        await self._open_server()
+
+    async def _cancel_reopen(self) -> bool:
+        reopen, self._reopen = self._reopen, None
+        if reopen is None:
+            return False
+        reopen.cancel()
+        await asyncio.gather(reopen, return_exceptions=True)
+        return True
+
+    async def _open_search(self) -> None:
+        loop = asyncio.get_running_loop()
+        bound = []
+        for port in self.search_ports:
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: _SeekResponder(self), sock=_search_socket(self.host, port)
+            )
+            self._search.append(transport)
+            bound.append(transport.get_extra_info("sockname")[1])
+        self.search_ports = tuple(bound)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -252,6 +389,7 @@ class CameraSimulator:
             accepted = channel == _TALK_CHANNEL and not self._talk_busy
             if accepted:
                 session.talking = True
+                self._talk_audio = []
             await session.send([*reply, "OK" if accepted else "ERROR"])
         elif action == "END":
             session.talking = False
@@ -266,6 +404,7 @@ class CameraSimulator:
         else:
             self.talk_frames.append(audio)
             self.talk_seqs.append(frame.seq)
+            self._talk_audio.append(audio)
 
     def _http_app(self) -> web.Application:
         app = web.Application(middlewares=[self._require_session])
@@ -305,7 +444,8 @@ class CameraSimulator:
         accepted = fields.get("passwd") == self._expected_passwd()
         session = ""
         if accepted:
-            session = f"SESSION-{len(self._http_sessions) + 1}"
+            # never reused, so a session dropped by drop() stays dead
+            session = f"SESSION-{next(self._http_session_ids)}"
             self._http_sessions.add(session)
         status = "OK" if accepted else "PASSWD ERROR"
         return _xml(
@@ -355,6 +495,22 @@ class CameraSimulator:
             if element in fields:
                 self.detection[name] = fields[element] == "true"
         return _xml(_WRITE_OK)
+
+
+def _search_socket(host: str, port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((host, port))
+        for group in _SEARCH_GROUPS:
+            membership = struct.pack("!4sI", socket.inet_aton(group), socket.INADDR_ANY)
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            except OSError as exc:
+                _log.warning("cannot join %s on UDP %d: %s", group, port, exc)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
 
 
 def _take_frame(buffer: bytearray) -> Frame | None:

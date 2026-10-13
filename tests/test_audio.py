@@ -2,7 +2,14 @@ import struct
 
 import pytest
 
-from sannce_aio.audio import G711A, G711U, encode_alaw, encode_ulaw, frame_talk_audio
+from sannce_aio.audio import (
+    G711A,
+    G711U,
+    decode_alaw,
+    encode_alaw,
+    encode_ulaw,
+    frame_talk_audio,
+)
 from sannce_aio.protocol import DATA_MAGIC, parse_frame
 
 DEVICE_IP = "192.168.1.10"
@@ -42,6 +49,23 @@ ALAW_VECTOR = [
     (-16384, 0x3A),
     (-32767, 0x2A),
     (-32768, 0x2A),
+]
+
+# ITU-T G.711 A-law decoding: each code reads as the middle of its step
+ALAW_DECODE_VECTOR = [
+    (0xD5, 8),
+    (0xD4, 24),
+    (0xC5, 264),
+    (0xF5, 528),
+    (0xE5, 1056),
+    (0x95, 2112),
+    (0x85, 4224),
+    (0xB5, 8448),
+    (0xA5, 16896),
+    (0xAA, 32256),
+    (0x55, -8),
+    (0x7A, -1008),
+    (0x2A, -32256),
 ]
 
 # ITU-T G.711 mu-law: bias 33 on the 14-bit magnitude. Negative samples follow
@@ -167,3 +191,17 @@ def test_frame_talk_audio_rejects_a_codec_it_cannot_encode(codec):
 
 def test_frame_talk_audio_of_no_audio_is_empty():
     assert frame_talk_audio(b"", G711A, 0, DEVICE_IP) == b""
+
+
+def test_decode_alaw_matches_itu_vector():
+    codes, samples = zip(*ALAW_DECODE_VECTOR)
+    assert decode_alaw(bytes(codes)) == pcm16(samples)
+
+
+def test_every_alaw_code_survives_decode_then_encode():
+    codes = bytes(range(256))
+    assert encode_alaw(decode_alaw(codes)) == codes
+
+
+def test_decode_alaw_of_no_audio_is_empty():
+    assert decode_alaw(b"") == b""

@@ -61,6 +61,22 @@ def encode_ulaw(pcm: bytes) -> bytes:
     return _encode(pcm, _ulaw)
 
 
+def _alaw_sample(code: int) -> int:
+    code ^= 0x55
+    segment = (code >> 4) & 0x07
+    value = (code & 0x0F) << 4
+    # the middle of the code's step, as in the ITU-T G.711 reference decoder
+    if segment == 0:
+        value += 8
+    else:
+        value = (value + 0x108) << (segment - 1)
+    return value if code & 0x80 else -value
+
+
+def decode_alaw(data: bytes) -> bytes:
+    return struct.pack(f"<{len(data)}h", *(_alaw_sample(code) for code in data))
+
+
 _ENCODERS = {G711A: encode_alaw, G711U: encode_ulaw}
 
 
