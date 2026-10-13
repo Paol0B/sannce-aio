@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import os
 import sys
 from collections.abc import Callable
 from typing import TextIO
@@ -13,6 +14,7 @@ from .events import Event
 
 _EXIT_FAILED = 1
 _EXIT_INTERRUPTED = 130
+_MAX_PORT = 65535
 
 _Emit = Callable[[dict | None, str], None]
 
@@ -38,12 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument(
         "--nvs-port",
-        type=int,
+        type=_port,
         default=3000,
         help="private protocol port (default: 3000)",
     )
     probe.add_argument(
-        "--http-port", type=int, default=80, help="HTTP port (default: 80)"
+        "--http-port", type=_port, default=80, help="HTTP port (default: 80)"
     )
     probe.add_argument(
         "--duration",
@@ -109,7 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         asyncio.run(args.run(args))
-    except (SannceError, ValueError) as exc:
+    except (SannceError, ValueError, OSError) as exc:
+        if isinstance(exc, BrokenPipeError):
+            _discard_stdout()
         print(f"error: {exc}", file=sys.stderr)
         return _EXIT_FAILED
     except KeyboardInterrupt:
@@ -168,6 +172,23 @@ async def _wait(duration: float | None) -> None:
 
 def _pairs(fields: dict) -> str:
     return " ".join(f"{name}={value or 'unknown'}" for name, value in fields.items())
+
+
+def _port(text: str) -> int:
+    try:
+        port = int(text)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= _MAX_PORT:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a port from 1 to {_MAX_PORT}"
+        )
+    return port
+
+
+def _discard_stdout() -> None:
+    # else the flush at exit fails too: a second error line and exit code 120
+    os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 if __name__ == "__main__":

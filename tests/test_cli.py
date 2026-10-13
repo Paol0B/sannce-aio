@@ -1,8 +1,12 @@
 import asyncio
+import errno
 import gc
 import io
 import json
+import os
 import signal
+import socket
+import struct
 import sys
 
 import pytest
@@ -55,6 +59,13 @@ class EagerSimulator(CameraSimulator):
     async def _logon(self, session, fields):
         await super()._logon(session, fields)
         await session.send(MOTION_START)
+
+
+class ResettingSimulator(CameraSimulator):
+    async def _logon(self, session, fields):
+        sock = session.writer.get_extra_info("socket")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        session.writer.transport.abort()
 
 
 class Responder(asyncio.DatagramProtocol):
@@ -137,13 +148,13 @@ async def start_simulator():
 async def spawn():
     processes = []
 
-    async def start(*argv):
+    async def start(*argv, stdout=asyncio.subprocess.PIPE):
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
             "sannce_aio",
             *argv,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=stdout,
             stderr=asyncio.subprocess.PIPE,
         )
         processes.append(process)
@@ -356,6 +367,55 @@ async def test_main_prints_one_error_line_when_login_fails(simulator, capsys):
     assert captured.out == ""
     assert captured.err.startswith("error: ")
     assert captured.err.count("\n") == 1
+
+
+async def test_main_prints_one_error_line_when_the_camera_resets_the_connection(
+    start_simulator, capsys
+):
+    simulator = await start_simulator(ResettingSimulator)
+
+    code = await asyncio.to_thread(cli.main, probe_argv(simulator))
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert os.strerror(errno.ECONNRESET) in captured.err
+    assert captured.err.count("\n") == 1
+
+
+async def test_a_closed_stdout_pipe_gives_one_error_line_and_exit_1(simulator, spawn):
+    read_end, write_end = os.pipe()
+    process = await spawn(*probe_argv(simulator, "--duration", "0"), stdout=write_end)
+    os.close(write_end)
+    os.close(read_end)
+
+    _, stderr = await asyncio.wait_for(process.communicate(), SPAWN_TIMEOUT)
+
+    lines = stderr.decode().splitlines()
+    assert process.returncode == 1
+    assert len(lines) == 1
+    assert lines[0].startswith("error: ")
+
+
+@pytest.mark.parametrize("flag", ["--nvs-port", "--http-port"])
+@pytest.mark.parametrize("port", ["0", "65536", "70000", "abc"])
+async def test_main_exits_2_with_usage_for_a_bad_port(simulator, capsys, flag, port):
+    with pytest.raises(SystemExit) as stop:
+        await asyncio.to_thread(cli.main, probe_argv(simulator, flag, port))
+
+    err = capsys.readouterr().err
+    assert stop.value.code == 2
+    assert err.startswith("usage: python -m sannce_aio probe")
+    assert f"error: argument {flag}: " in err
+
+
+async def test_ports_1_and_65535_are_accepted():
+    argv = ["probe", "127.0.0.1", "--nvs-port", "1", "--http-port", "65535"]
+
+    args = cli.build_parser().parse_args(argv)
+
+    assert (args.nvs_port, args.http_port) == (1, 65535)
 
 
 async def test_main_rejects_a_host_that_is_a_url(capsys):
