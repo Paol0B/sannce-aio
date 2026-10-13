@@ -15,6 +15,7 @@ _DENIED = (401, 403)
 _SESSION_CHECK = "/CGI/Security/SessionCheck"
 _LOGON = "/CGI/Security/Logon"
 _USER_CHECK = "/ISAPI/Security/userCheck"
+_DEVICE_INFO = "/CGI/System/deviceInfo"
 _LIGHT = "/ISAPI/Image/channels/{}/WhiteLight"
 _MODE = "/CGI/System/CommonEnable/channels/{}/Type/4120"
 _DETECTION = "/ISAPI/System/Video/inputs/channels/{}/motionDetection"
@@ -152,6 +153,17 @@ class HttpClient:
             "person": "people" in found,
             "vehicle": "car" in found,
             "motion": "all" in found,
+        }
+
+    async def get_device_info(self) -> dict[str, str | None]:
+        # the bean carries firmware only; model, serial and mac are absent on this
+        # camera but kept here best-effort for devices that do send them (protocol.md)
+        root = _parse(await self._request("GET", _DEVICE_INFO), "DeviceInfo")
+        return {
+            "model": _text(root, "model") or None,
+            "serial": _text(root, "serialNumber") or None,
+            "firmware": _text(root, "firmwareVersion") or None,
+            "mac": _text(root, "macAddress") or None,
         }
 
     async def _write(self, path: str, body: str) -> None:

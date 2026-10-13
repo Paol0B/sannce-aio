@@ -1,0 +1,263 @@
+import asyncio
+import struct
+
+import pytest
+import pytest_asyncio
+
+from sannce_aio import (
+    AuthError,
+    CameraInfo,
+    Event,
+    SannceCamera,
+    TalkBusyError,
+)
+from sannce_aio.audio import SUBFRAME_PCM_BYTES, encode_alaw
+
+pytestmark = pytest.mark.asyncio
+
+MOTION_START = ["INNER", "ALARM", "MOTIONDETECT", "0", "1"]
+MOTION_STOP = ["INNER", "ALARM", "MOTIONDETECT", "0", "0"]
+PCM = struct.pack("<240h", *range(-12000, 12000, 100))
+SUBFRAMES = [
+    encode_alaw(PCM[start : start + SUBFRAME_PCM_BYTES])
+    for start in range(0, len(PCM), SUBFRAME_PCM_BYTES)
+]
+
+
+async def wait_until(predicate, timeout=3.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition was not met in time")
+
+
+async def async_iter(chunks):
+    for chunk in chunks:
+        yield chunk
+
+
+@pytest_asyncio.fixture
+async def make_camera(simulator):
+    created = []
+
+    def make(*, username=None, password=None, event_timeout=10.0):
+        camera = SannceCamera(
+            simulator.host,
+            simulator.username if username is None else username,
+            simulator.password if password is None else password,
+            nvs_port=simulator.port,
+            http_port=simulator.http_port,
+            event_timeout=event_timeout,
+        )
+        created.append(camera)
+        return camera
+
+    yield make
+    for camera in created:
+        await camera.close()
+
+
+async def test_connect_populates_info_and_caps(make_camera):
+    camera = make_camera()
+
+    await camera.connect()
+
+    assert camera.info == CameraInfo(model=None, serial=None, firmware="1.0.0", mac=None)
+    assert {
+        "person",
+        "vehicle",
+        "motion",
+        "white_light",
+        "light_mode",
+        "talk",
+    } <= camera.caps
+
+
+async def test_connect_bad_credentials_raises_auth_error(make_camera):
+    camera = make_camera(password="wrong")
+
+    with pytest.raises(AuthError):
+        await camera.connect()
+
+
+async def test_set_light_reaches_the_http_side(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+
+    await camera.set_light(True)
+    assert simulator.light_control == 1
+    assert await camera.get_light() is True
+
+    await camera.set_light(False)
+    assert simulator.light_control == 0
+    assert await camera.get_light() is False
+
+
+async def test_rtsp_url_main_and_sub(simulator, make_camera):
+    camera = make_camera()
+    base = f"rtsp://{simulator.username}:{simulator.password}@{simulator.host}:554"
+
+    assert camera.rtsp_url("main") == base + "/1/1"
+    assert camera.rtsp_url("sub") == base + "/1/2"
+
+
+async def test_rtsp_url_rejects_unknown_stream(make_camera):
+    camera = make_camera()
+
+    with pytest.raises(ValueError):
+        camera.rtsp_url("high")
+
+
+@pytest.mark.parametrize("host", ["a/b", "a?b", "a#b", "user@host", ""])
+async def test_constructor_rejects_bad_host(host):
+    with pytest.raises(ValueError):
+        SannceCamera(host, "admin", "admin123")
+
+
+async def test_subscribe_receives_start_then_autoclear(simulator, make_camera):
+    camera = make_camera(event_timeout=0.1)
+    await camera.connect()
+    seen = []
+    camera.subscribe(seen.append)
+
+    await simulator.push_event(MOTION_START)
+    await wait_until(lambda: len(seen) == 1)
+    assert seen[0] == Event("motion", True, 0)
+
+    await wait_until(lambda: len(seen) == 2)
+    assert seen[1] == Event("motion", False, 0)
+
+
+async def test_event_autoclear_cancelled_by_real_stop(simulator, make_camera):
+    camera = make_camera(event_timeout=0.2)
+    await camera.connect()
+    seen = []
+    camera.subscribe(seen.append)
+
+    await simulator.push_event(MOTION_START)
+    await wait_until(lambda: len(seen) == 1)
+    await simulator.push_event(MOTION_STOP)
+    await wait_until(lambda: len(seen) == 2)
+
+    assert seen == [Event("motion", True, 0), Event("motion", False, 0)]
+    await asyncio.sleep(0.3)
+    assert len(seen) == 2
+
+
+async def test_unsubscribe_stops_delivery(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+    seen = []
+    unsub = camera.subscribe(seen.append)
+
+    await simulator.push_event(MOTION_START)
+    await wait_until(lambda: len(seen) == 1)
+    unsub()
+    await simulator.push_event(MOTION_STOP)
+    await asyncio.sleep(0.1)
+
+    assert len(seen) == 1
+
+
+async def test_raising_subscriber_does_not_block_others(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+    good = []
+
+    def bad(_event):
+        raise RuntimeError("subscriber boom")
+
+    camera.subscribe(bad)
+    camera.subscribe(good.append)
+
+    await simulator.push_event(MOTION_START)
+    await wait_until(lambda: good == [Event("motion", True, 0)])
+
+
+async def test_on_availability_reports_up_then_down(make_camera):
+    camera = make_camera()
+    states = []
+    camera.on_availability(states.append)
+
+    await camera.connect()
+    await wait_until(lambda: states == [True])
+    await camera.close()
+
+    assert states == [True, False]
+
+
+async def test_play_audio_streams_rechunked_frames_and_stops_talk(
+    simulator, make_camera
+):
+    camera = make_camera()
+    await camera.connect()
+
+    await camera.play_audio(async_iter([PCM[:100], PCM[100:300], PCM[300:]]))
+
+    assert simulator.talk_frames == SUBFRAMES
+    assert not simulator.talking
+
+
+async def test_play_audio_zero_pads_a_trailing_partial_frame(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+    pcm = PCM[: SUBFRAME_PCM_BYTES + 80]
+
+    await camera.play_audio(async_iter([pcm]))
+
+    padded = pcm[SUBFRAME_PCM_BYTES:] + bytes(SUBFRAME_PCM_BYTES - 80)
+    assert simulator.talk_frames == [
+        encode_alaw(pcm[:SUBFRAME_PCM_BYTES]),
+        encode_alaw(padded),
+    ]
+    assert not simulator.talking
+
+
+async def test_play_audio_raises_busy_when_talk_is_held(simulator, make_camera):
+    simulator.set_talk_busy(True)
+    camera = make_camera()
+    await camera.connect()
+
+    with pytest.raises(TalkBusyError):
+        await camera.play_audio(async_iter([PCM]))
+
+    assert not simulator.talking
+
+
+async def test_play_audio_stops_talk_on_producer_error(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+
+    async def producer():
+        yield PCM
+        raise RuntimeError("producer boom")
+
+    with pytest.raises(RuntimeError):
+        await camera.play_audio(producer())
+
+    await wait_until(lambda: not simulator.talking)
+
+
+async def test_play_audio_stops_talk_on_cancel(simulator, make_camera):
+    camera = make_camera()
+    await camera.connect()
+    started = asyncio.Event()
+
+    async def producer():
+        yield PCM
+        started.set()
+        await asyncio.sleep(10)
+        yield PCM
+
+    task = asyncio.create_task(camera.play_audio(producer()))
+    await started.wait()
+    await wait_until(lambda: simulator.talking)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await wait_until(lambda: not simulator.talking)
