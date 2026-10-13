@@ -26,6 +26,7 @@ PUBLIC_NAMES = {
     "SannceError",
     "TalkBusyError",
     "discover",
+    "find_camera",
 }
 
 
@@ -58,6 +59,7 @@ def test_public_name_resolves(name):
 def test_entry_points_have_the_documented_kind():
     assert inspect.isclass(sannce_aio.SannceCamera)
     assert inspect.iscoroutinefunction(sannce_aio.discover)
+    assert inspect.iscoroutinefunction(sannce_aio.find_camera)
 
 
 def test_project_identity(pyproject):

@@ -139,6 +139,8 @@ asyncio.run(main())
 
 `discover()` returns `list[DiscoveredCamera]` with `ip`, `mac`, `serial`, `model`, `http_port`, `server_port` and `channels`. It sends a UDP multicast search and collects replies for `timeout` seconds. Run it on the camera's LAN.
 
+`find_camera(ip, timeout=2.0)` looks for one camera. It sends the same search to the groups and to `ip` itself on ports 3000 and 4000, and returns the `DiscoveredCamera` whose `ip` matches as soon as it answers. It returns `None` when nothing answers within `timeout` seconds, or at once when `ip` is not an IPv4 address.
+
 ### Audio
 
 `play_audio(pcm)` takes an async iterable of `bytes`: 16-bit signed little-endian mono PCM at 8000 Hz, in chunks of any size. The library encodes G.711 A-law and sends 10 ms frames at real-time speed. It ends the talk session when the stream ends, fails or is cancelled. It raises `TalkBusyError` if the camera refuses talk. Two calls on one `SannceCamera` run one after the other: the second waits for the first.

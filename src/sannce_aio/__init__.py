@@ -1,5 +1,5 @@
 from .camera import CameraInfo, SannceCamera
-from .discovery import DiscoveredCamera, discover
+from .discovery import DiscoveredCamera, discover, find_camera
 from .errors import (
     AuthError,
     ConnectError,
@@ -22,4 +22,5 @@ __all__ = [
     "SannceError",
     "TalkBusyError",
     "discover",
+    "find_camera",
 ]
