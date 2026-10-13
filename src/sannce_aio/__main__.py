@@ -3,18 +3,28 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from typing import TextIO
 
 from .camera import SannceCamera
+from .control import start_control
 from .discovery import discover
 from .errors import SannceError
 from .events import Event
+from .simulator import (
+    DEFAULT_MAC,
+    DEFAULT_MODEL,
+    DEFAULT_SERIAL,
+    SEARCH_PORTS,
+    CameraSimulator,
+)
 
 _EXIT_FAILED = 1
 _EXIT_INTERRUPTED = 130
 _MAX_PORT = 65535
+_MAC_SHAPE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
 
 _Emit = Callable[[dict | None, str], None]
 
@@ -69,6 +79,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for replies (default: 3)",
     )
     find.set_defaults(run=run_discover)
+
+    simulate = commands.add_parser(
+        "simulate", help="run a simulated camera with a control API"
+    )
+    simulate.add_argument(
+        "--host", default="0.0.0.0", help="address to listen on (default: 0.0.0.0)"
+    )
+    simulate.add_argument(
+        "--nvs-port",
+        type=_port,
+        default=3000,
+        help="private protocol port (default: 3000)",
+    )
+    simulate.add_argument(
+        "--http-port", type=_port, default=80, help="HTTP port (default: 80)"
+    )
+    simulate.add_argument(
+        "--control-port",
+        type=_port,
+        default=8099,
+        help="control API port (default: 8099)",
+    )
+    simulate.add_argument(
+        "--user", default="admin", help="camera user (default: admin)"
+    )
+    simulate.add_argument(
+        "--pass",
+        dest="password",
+        default="admin123",
+        help="camera password (default: admin123)",
+    )
+    simulate.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"model in the LAN search reply (default: {DEFAULT_MODEL})",
+    )
+    simulate.add_argument(
+        "--serial",
+        default=DEFAULT_SERIAL,
+        help=f"serial in the LAN search reply (default: {DEFAULT_SERIAL})",
+    )
+    simulate.add_argument(
+        "--mac",
+        type=_mac,
+        default=DEFAULT_MAC,
+        help=f"MAC in the LAN search reply (default: {DEFAULT_MAC})",
+    )
+    simulate.set_defaults(run=run_simulate)
     return parser
 
 
@@ -105,6 +163,38 @@ async def run_discover(args: argparse.Namespace, out: TextIO | None = None) -> N
         emit(fields, _pairs(fields))
     if not cameras:
         emit(None, "no cameras found")
+
+
+async def run_simulate(args: argparse.Namespace, out: TextIO | None = None) -> None:
+    stream = sys.stdout if out is None else out
+    simulator = CameraSimulator(
+        host=args.host,
+        username=args.user,
+        password=args.password,
+        port=args.nvs_port,
+        http_port=args.http_port,
+        search_ports=SEARCH_PORTS,
+        model=args.model,
+        serial=args.serial,
+        mac=args.mac,
+    )
+    await simulator.start()
+    try:
+        control = await start_control(simulator, args.host, args.control_port)
+        try:
+            search = " ".join(str(port) for port in simulator.search_ports)
+            print(
+                f"simulating {args.model} on {args.host}: nvs {simulator.port}, "
+                f"http {simulator.http_port}, search {search}, "
+                f"control {control.addresses[0][1]}",
+                file=stream,
+                flush=True,
+            )
+            await asyncio.Event().wait()
+        finally:
+            await control.cleanup()
+    finally:
+        await simulator.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,6 +274,12 @@ def _port(text: str) -> int:
             f"{text!r} is not a port from 1 to {_MAX_PORT}"
         )
     return port
+
+
+def _mac(text: str) -> str:
+    if not _MAC_SHAPE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a MAC like {DEFAULT_MAC}")
+    return text
 
 
 def _discard_stdout() -> None:

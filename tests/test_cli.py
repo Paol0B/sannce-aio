@@ -4,17 +4,21 @@ import gc
 import io
 import json
 import os
+import re
 import signal
 import socket
 import struct
 import sys
 
+import aiohttp
 import pytest
 import pytest_asyncio
 from aiohttp import web
 
 from sannce_aio import __main__ as cli
 from sannce_aio import discovery
+from sannce_aio.camera import SannceCamera
+from sannce_aio.discovery import build_seek_request, parse_discovery_reply
 from sannce_aio.errors import AuthError
 from sannce_aio.simulator import CameraSimulator
 
@@ -32,6 +36,9 @@ OTHER_LINE = (
     "http_port=80 server_port=3000 channels=1"
 )
 SPAWN_TIMEOUT = 20
+READY = re.compile(
+    r"simulating (\S+) on (\S+): nvs (\d+), http (\d+), search (\d+), control (\d+)"
+)
 NO_SIGINT = sys.platform == "win32" or signal.getsignal(signal.SIGINT) is signal.SIG_IGN
 
 
@@ -488,3 +495,129 @@ async def test_main_runs_discover(lan, camera_reply, capsys):
 
     assert code == 0
     assert capsys.readouterr().out.splitlines() == [CAMERA_LINE]
+
+
+class SeekReceiver(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.replies = asyncio.Queue()
+
+    def datagram_received(self, data, addr):
+        self.replies.put_nowait((data, addr))
+
+
+@pytest_asyncio.fixture
+async def simulate(monkeypatch):
+    monkeypatch.setattr(cli, "SEARCH_PORTS", (0,))
+    tasks = []
+
+    async def start(*argv):
+        args = cli.build_parser().parse_args(["simulate", "--host", "127.0.0.1", *argv])
+        args.nvs_port = args.http_port = args.control_port = 0
+        out = io.StringIO()
+        task = asyncio.create_task(cli.run_simulate(args, out))
+        tasks.append(task)
+        await wait_until(lambda: READY.search(out.getvalue()))
+        return task, READY.search(out.getvalue())
+
+    yield start
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_simulate_defaults():
+    args = cli.build_parser().parse_args(["simulate"])
+
+    assert (args.host, args.nvs_port, args.http_port, args.control_port) == (
+        "0.0.0.0",
+        3000,
+        80,
+        8099,
+    )
+    assert (args.user, args.password) == ("admin", "admin123")
+    assert (args.model, args.serial, args.mac) == (
+        "I91FW-SIM",
+        "SIM0000000001",
+        "00:00:5E:00:53:01",
+    )
+
+
+@pytest.mark.parametrize(
+    "mac", ["", "00:00:5E:00:53", "00-00-5E-00-53-01", "00:00:5E:00:53:0G"]
+)
+async def test_simulate_rejects_a_mac_of_the_wrong_shape(capsys, mac):
+    with pytest.raises(SystemExit) as stop:
+        cli.build_parser().parse_args(["simulate", "--mac", mac])
+
+    assert stop.value.code == 2
+    assert "error: argument --mac: " in capsys.readouterr().err
+
+
+async def test_simulate_serves_the_camera_and_its_control_api(simulate):
+    _, ready = await simulate("--pass", "secret", "--model", "CAM-SIM")
+    model, host, nvs, http, _, control = ready.groups()
+    camera = SannceCamera(
+        host, "admin", "secret", nvs_port=int(nvs), http_port=int(http)
+    )
+
+    try:
+        await camera.connect()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{host}:{control}/state") as reply:
+                state = await reply.json()
+    finally:
+        await camera.close()
+
+    assert (model, host) == ("CAM-SIM", "127.0.0.1")
+    assert (state["clients"], state["password"]) == (1, "secret")
+
+
+async def test_simulate_answers_the_lan_search(simulate):
+    _, ready = await simulate("--serial", "SN-SIM")
+    _, host, nvs, http, search, _ = ready.groups()
+    loop = asyncio.get_running_loop()
+    transport, receiver = await loop.create_datagram_endpoint(
+        SeekReceiver, local_addr=("127.0.0.1", 0)
+    )
+
+    try:
+        transport.sendto(build_seek_request(), (host, int(search)))
+        data, source = await asyncio.wait_for(receiver.replies.get(), 2)
+    finally:
+        transport.close()
+
+    found = parse_discovery_reply(data, source[0])
+    assert (found.ip, found.serial, found.server_port, found.http_port) == (
+        "127.0.0.1",
+        "SN-SIM",
+        int(nvs),
+        int(http),
+    )
+
+
+async def test_simulate_closes_its_ports_when_cancelled(simulate):
+    task, ready = await simulate()
+    _, host, nvs, _, _, control = ready.groups()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for port in (nvs, control):
+        with pytest.raises(ConnectionRefusedError):
+            await asyncio.open_connection(host, int(port))
+
+
+async def test_main_prints_one_error_line_when_a_simulate_port_is_taken(capsys):
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        argv = ["simulate", "--host", "127.0.0.1"]
+        argv += ["--nvs-port", str(holder.getsockname()[1])]
+
+        code = await asyncio.to_thread(cli.main, argv)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.startswith("error: ")
+    assert captured.err.count("\n") == 1

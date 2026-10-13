@@ -241,6 +241,36 @@ event: motion clear channel=0
 - Defaults: user `admin`, empty password, ports 3000 and 80.
 - Exit code 0 on success, 1 on an error (message on stderr), 2 on bad arguments (usage on stderr), 130 on Ctrl-C.
 
+## Simulator
+
+`python -m sannce_aio simulate` runs `sannce_aio.simulator.CameraSimulator` as a fake camera. The bench in `bench/` runs it in a container. It follows the same spec as the library, so it shows that the parts fit together, not that a camera behaves this way.
+
+```sh
+python -m sannce_aio simulate [--host HOST] [--nvs-port PORT] [--http-port PORT]
+                              [--control-port PORT] [--user USER] [--pass PASSWORD]
+                              [--model MODEL] [--serial SERIAL] [--mac MAC]
+```
+
+- Defaults: host `0.0.0.0`, private protocol port 3000, HTTP port 80, control port 8099, user `admin`, password `admin123`, model `I91FW-SIM`, serial `SIM0000000001`, MAC `00:00:5E:00:53:01`.
+- It answers the LAN search on UDP 3000 and 4000 and joins both search groups. `--model`, `--serial` and `--mac` go into that reply.
+- Port 80 needs root outside a container. Docker lets any user bind it inside one.
+- It prints one line when it is ready, then runs until Ctrl-C.
+
+The control API takes and returns JSON over HTTP, with no login. Keep it off untrusted networks.
+
+| Request | Effect |
+|---|---|
+| `GET /state` | light, light mode, detection flags, client count, talking, user and password |
+| `POST /event {"kind", "active"}` | push an event: `motion`, `vehicle`, `intrusion`, `line`, `tamper` or `video_loss` |
+| `POST /settings {"light", "light_mode", "detection"}` | change any of them, as the vendor app would. `light` false means auto |
+| `POST /password {"password"}` | change the password that new logins must use. Open sessions stay |
+| `POST /drop {"seconds"}` | close every session and refuse connections for that long, like a reboot |
+| `POST /talk-busy {"busy"}` | refuse talk requests, as if the app held the channel |
+| `GET /audio.wav` | the current or last talk session as 8 kHz mono 16-bit WAV |
+| `POST /reset` | back to the start state |
+
+Requests that change something answer 204. A bad body answers 400 with a one-line reason.
+
 ## Tests
 
 ```sh

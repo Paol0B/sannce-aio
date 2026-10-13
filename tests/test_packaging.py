@@ -110,7 +110,7 @@ def test_readme_names_every_public_export():
     assert missing == []
 
 
-@pytest.mark.parametrize("command", ["probe", "discover"])
+@pytest.mark.parametrize("command", ["probe", "discover", "simulate"])
 def test_readme_documents_the_cli_command_and_its_flags(command, capsys):
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args([command, "--help"])
