@@ -24,7 +24,7 @@ The spec and its open questions are in [docs/protocol.md](https://github.com/Pao
 
 Python 3.11 or newer. The only runtime dependency is aiohttp 3.12 or newer. CI runs the tests on Python 3.11 to 3.14.
 
-The library is not on PyPI yet. Run from the repository root. The second command is an editable install that adds pytest.
+The library is not on PyPI yet. Run from the directory that holds `pyproject.toml`. The second command is an editable install that adds pytest.
 
 ```sh
 pip install .
