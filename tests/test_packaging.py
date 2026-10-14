@@ -126,6 +126,5 @@ def test_readme_documents_the_cli_command_and_its_flags(command, capsys):
     assert [flag for flag in sorted(flags) if flag not in text] == []
 
 
-def test_readme_links_resolve():
-    targets = re.findall(r"\]\((?!https?:)([^)#]+)", read_readme())
-    assert [target for target in targets if not (LIB / target).exists()] == []
+def test_readme_has_no_relative_links():
+    assert re.findall(r"\]\((?!https?:|#)([^)]+)", read_readme()) == []
