@@ -9,6 +9,7 @@ import re
 import socket
 import wave
 import xml.etree.ElementTree as ET
+from typing import cast
 
 from aiohttp import web
 from aiohttp.typedefs import Handler
@@ -142,8 +143,8 @@ class _SeekResponder(asyncio.DatagramProtocol):
         self._transport: asyncio.DatagramTransport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        assert isinstance(transport, asyncio.DatagramTransport)
-        self._transport = transport
+        # on Python 3.11 the selector datagram transport is not a DatagramTransport
+        self._transport = cast(asyncio.DatagramTransport, transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         # a dropped camera is rebooting, so it answers no search either
