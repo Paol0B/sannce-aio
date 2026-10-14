@@ -18,7 +18,7 @@ Behavior may change after the first run on a real I91FW. Likely trouble spots:
 - Events. Stop codes and `VCA` rule values are partly inferred. Only two rule values are mapped.
 - Discovery. The ports the camera answers on, and its reply layout, are open.
 
-The spec and its open questions are in [docs/protocol.md](../docs/protocol.md). The checks to run when a camera is on the bench are in [docs/hardware-checklist.md](../docs/hardware-checklist.md).
+The spec and its open questions are in [docs/protocol.md](https://github.com/Paol0B/ha-sannce/blob/master/docs/protocol.md). The checks to run when a camera is on the bench are in [docs/hardware-checklist.md](https://github.com/Paol0B/ha-sannce/blob/master/docs/hardware-checklist.md).
 
 ## Install
 

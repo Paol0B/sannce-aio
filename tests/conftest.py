@@ -6,7 +6,7 @@ import pytest_asyncio
 
 from sannce_aio.simulator import CameraSimulator
 
-EXAMPLES_PATH = Path(__file__).resolve().parents[2] / "docs" / "protocol-examples.json"
+EXAMPLES_PATH = Path(__file__).resolve().parent / "data" / "protocol-examples.json"
 
 
 def load_examples():

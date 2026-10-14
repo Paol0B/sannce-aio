@@ -128,5 +128,4 @@ def test_readme_documents_the_cli_command_and_its_flags(command, capsys):
 
 def test_readme_links_resolve():
     targets = re.findall(r"\]\((?!https?:)([^)#]+)", read_readme())
-    assert targets
     assert [target for target in targets if not (LIB / target).exists()] == []

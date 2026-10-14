@@ -8,10 +8,37 @@ version = "0.1.0"
 description = "Asyncio library for SANNCE/Tiandy wired IP cameras on the LAN"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Paolo Bertinetti", email = "paolobertinetti200f4@proton.me" }]
+keywords = ["sannce", "tiandy", "ip-camera", "asyncio", "home-assistant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Home Automation",
+    "Typing :: Typed",
+]
 dependencies = ["aiohttp>=3.12"]
+
+[project.urls]
+Homepage = "https://github.com/Paol0B/sannce-aio"
+Repository = "https://github.com/Paol0B/sannce-aio"
+Issues = "https://github.com/Paol0B/sannce-aio/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sannce_aio"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
