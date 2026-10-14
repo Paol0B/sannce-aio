@@ -22,13 +22,13 @@ The spec and its open questions are in [docs/protocol.md](https://github.com/Pao
 
 ## Install
 
-Python 3.11 or newer. The only runtime dependency is aiohttp 3.12 or newer. The tests have run on Python 3.14 only.
+Python 3.11 or newer. The only runtime dependency is aiohttp 3.12 or newer. CI runs the tests on Python 3.11 to 3.14.
 
-Run from the repository root. The second command is an editable install that adds pytest.
+The library is not on PyPI yet. Run from the repository root. The second command is an editable install that adds pytest.
 
 ```sh
-pip install ./lib
-pip install -e "./lib[dev]"
+pip install .
+pip install -e ".[dev]"
 ```
 
 ## Quick start
@@ -117,7 +117,7 @@ unsubscribe = camera.subscribe(on_event)
 
 After a drop the library retries at once, then waits 1 s, doubling the wait up to 60 s. It gives up after 3 refused logins, logs an error and calls each `on_login_failed` callback with the last `AuthError`. The connection then stays down. The retries and the return are logged at debug level on the `sannce_aio.connection` logger, the give-up as an error.
 
-The library sends a heartbeat every 3 s but has no silence timeout yet. A camera that stops without closing the TCP connection can stay "available" until the operating system gives up on it. See "Silence timeout" in docs/protocol.md.
+The library sends a heartbeat every 3 s but has no silence timeout yet. A camera that stops without closing the TCP connection can stay "available" until the operating system gives up on it. See "Silence timeout" in [docs/protocol.md](https://github.com/Paol0B/ha-sannce/blob/master/docs/protocol.md).
 
 ### Info and discovery
 
@@ -210,7 +210,7 @@ asyncio.run(main())
 
 `SannceCamera` has no `login` argument yet. It builds its own connection with `PlaintextLogin`.
 
-The encrypted login is documented, not implemented. Some cameras may refuse the plaintext login and ask for a digest login. Its spec lives in a separate branch or module, not in docs/protocol.md here. That login needs a second logon message after the camera's first reply, and a step cannot send one yet. On a camera that insists on it, the private login ends in `AuthError`: a timeout or a closed connection. Check 4.1 of the hardware checklist finds out which login the I91FW accepts.
+The encrypted login is documented, not implemented. Some cameras may refuse the plaintext login and ask for a digest login. Its spec lives in a separate branch or module, not in [docs/protocol.md](https://github.com/Paol0B/ha-sannce/blob/master/docs/protocol.md). That login needs a second logon message after the camera's first reply, and a step cannot send one yet. On a camera that insists on it, the private login ends in `AuthError`: a timeout or a closed connection. Check 4.1 of the hardware checklist finds out which login the I91FW accepts.
 
 ## CLI
 
@@ -245,7 +245,7 @@ event: motion clear channel=0
 
 ## Simulator
 
-`python -m sannce_aio simulate` runs `sannce_aio.simulator.CameraSimulator` as a fake camera. The bench in `bench/` runs it in a container. It follows the same spec as the library, so it shows that the parts fit together, not that a camera behaves this way.
+`python -m sannce_aio simulate` runs `sannce_aio.simulator.CameraSimulator` as a fake camera. The bench in [`bench/`](https://github.com/Paol0B/ha-sannce/tree/master/bench) runs it in a container. It follows the same spec as the library, so it shows that the parts fit together, not that a camera behaves this way.
 
 ```sh
 python -m sannce_aio simulate [--host HOST] [--nvs-port PORT] [--http-port PORT]
@@ -276,8 +276,8 @@ Requests that change something answer 204. A bad body answers 400 with a one-lin
 ## Tests
 
 ```sh
-pip install -e "./lib[dev]"
-python -m pytest lib/tests -q
+pip install -e ".[dev]"
+python -m pytest -q
 ```
 
 The tests run against `sannce_aio.simulator.CameraSimulator`, a fake camera on localhost. They need no camera.
