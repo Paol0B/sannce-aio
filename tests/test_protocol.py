@@ -4,11 +4,13 @@ from sannce_aio.errors import ProtocolError
 from sannce_aio.protocol import (
     COMMAND_MAGIC,
     DATA_MAGIC,
+    TERMINATOR,
     Frame,
     build_command,
     build_data,
-    decode_fields,
+    decode_commands,
     encode_fields,
+    pack_command,
     parse_frame,
 )
 
@@ -18,6 +20,11 @@ FRAME_EXAMPLES = ["framing_parameter_get_request", "talk_audio_frame_g711a"]
 
 def raw(examples, example_id):
     return bytes.fromhex(examples[example_id]["hex"])
+
+
+def commands_of(payload):
+    frame, _ = parse_frame(pack_command(payload, 0))
+    return frame.commands
 
 
 def test_build_command_matches_parameter_get_request(examples):
@@ -31,11 +38,11 @@ def test_parse_frame_two_messages_in_one_read(examples):
     data = raw(examples, "framing_two_messages_one_read")
 
     first, used = parse_frame(data)
-    assert first == Frame(COMMAND_MAGIC, 0, fields=fields["message_1"]["payload"])
+    assert first == Frame(COMMAND_MAGIC, 0, commands=[fields["message_1"]["payload"]])
     assert used == fields["message_2"]["offset"]
 
     second, used_second = parse_frame(data[used:])
-    assert second == Frame(COMMAND_MAGIC, 1, fields=fields["message_2"]["payload"])
+    assert second == Frame(COMMAND_MAGIC, 1, commands=[fields["message_2"]["payload"]])
     assert used + used_second == fields["read_length"]
 
 
@@ -48,7 +55,9 @@ def test_command_examples_round_trip(examples):
             continue
         frame, used = parse_frame(data)
         assert frame is not None, example_id
-        assert build_command(frame.fields, frame.seq) == data[:used], example_id
+        [fields] = frame.commands or [[]]
+        extra = TERMINATOR * (example.get("fields", {}).get("terminators", 1) - 1)
+        assert pack_command(encode_fields(fields) + extra, frame.seq) == data[:used], example_id
         checked += 1
     assert checked
 
@@ -57,7 +66,52 @@ def test_empty_command_is_heartbeat(examples):
     data = raw(examples, "heartbeat_request")
     sequence = examples["heartbeat_request"]["fields"]["sequence"]
     assert build_command([], sequence) == data
-    assert parse_frame(data) == (Frame(COMMAND_MAGIC, sequence, fields=[]), len(data))
+    assert parse_frame(data) == (Frame(COMMAND_MAGIC, sequence, commands=[]), len(data))
+
+
+def test_a_doubled_terminator_ends_one_command():
+    payload = b"192.168.1.10\tPROXY\tINNER\tALARM\tVIDEOLOST\t0\t0\n\n\n\n\n\n"
+    assert commands_of(payload) == [[DEVICE_IP, "PROXY", "INNER", "ALARM", "VIDEOLOST", "0", "0"]]
+
+
+def test_later_commands_take_the_ip_and_route_of_the_first():
+    payload = (
+        b"192.168.1.10\tIP\tINNER\tUSER\tRESERVEPHONE\t2\t0\towner@example.com\t\n\n\n"
+        b"INNER\tSUPER\tGETUSERNUM\t2\n\n\n"
+    )
+    assert commands_of(payload) == [
+        [DEVICE_IP, "IP", "INNER", "USER", "RESERVEPHONE", "2", "0", "owner@example.com", ""],
+        [DEVICE_IP, "IP", "INNER", "SUPER", "GETUSERNUM", "2"],
+    ]
+
+
+@pytest.mark.parametrize("route", ["IP", "PROXY"])
+def test_a_later_command_with_its_own_ip_and_route_keeps_them(route):
+    payload = (
+        b"192.168.1.10\tIP\tINNER\tCMDID\t7\n\n\n"
+        + f"{DEVICE_IP}\t{route}\tINNER\tLOGON\tFINISHED\n\n\n".encode()
+    )
+    assert commands_of(payload) == [
+        [DEVICE_IP, "IP", "INNER", "CMDID", "7"],
+        [DEVICE_IP, route, "INNER", "LOGON", "FINISHED"],
+    ]
+
+
+def test_empty_commands_are_dropped():
+    payload = (
+        b"192.168.1.10\tIP\tINNER\tCMDID\t7\n\n\n\n\n\n"
+        b"INNER\tLOGON\tFINISHED\n\n\n\n\n\n"
+    )
+    assert commands_of(payload) == [
+        [DEVICE_IP, "IP", "INNER", "CMDID", "7"],
+        [DEVICE_IP, "IP", "INNER", "LOGON", "FINISHED"],
+    ]
+    assert commands_of(b"\n\n\n\n\n\n") == []
+
+
+def test_an_unterminated_last_command_is_dropped():
+    payload = b"192.168.1.10\tIP\tINNER\tCMDID\t7\n\n\nINNER\tLOGON"
+    assert commands_of(payload) == [[DEVICE_IP, "IP", "INNER", "CMDID", "7"]]
 
 
 def test_build_data_matches_talk_audio_frame(examples):
@@ -75,8 +129,6 @@ def test_parse_frame_reads_data_packet(examples):
 @pytest.mark.parametrize(
     "fields",
     [
-        [],
-        [""],
         ["a", ""],
         ["", "a"],
         ["a", "", "b"],
@@ -85,12 +137,12 @@ def test_parse_frame_reads_data_packet(examples):
     ],
 )
 def test_fields_round_trip(fields):
-    assert decode_fields(encode_fields(fields)) == fields
+    assert decode_commands(encode_fields(fields)) == [fields]
 
 
 def test_encode_fields_uses_utf8():
     assert encode_fields(["caf\u00e9"]) == b"caf\xc3\xa9\n\n\n"
-    assert decode_fields(b"caf\xc3\xa9\n\n\n") == ["caf\u00e9"]
+    assert decode_commands(b"caf\xc3\xa9\n\n\n") == [["caf\u00e9"]]
 
 
 def test_field_list_rejects_raw_tab():
@@ -110,13 +162,12 @@ def test_field_list_rejects_terminator_inside_value():
     ("payload", "reason"),
     [
         pytest.param(b"a\tb", "no terminator", id="no_terminator"),
-        pytest.param(b"a\n\n\nb\n\n\n", "more than one command", id="two_commands"),
         pytest.param(b"\xff\xfe\n\n\n", "not UTF-8", id="not_utf8"),
     ],
 )
-def test_decode_fields_rejects_malformed_payload(payload, reason):
+def test_decode_commands_rejects_malformed_payload(payload, reason):
     with pytest.raises(ProtocolError, match=reason):
-        decode_fields(payload)
+        decode_commands(payload)
 
 
 def test_sequence_is_little_endian_and_sized_per_packet_kind():

@@ -1,5 +1,4 @@
 import asyncio
-import errno
 import gc
 import io
 import json
@@ -7,7 +6,6 @@ import os
 import re
 import signal
 import socket
-import struct
 import sys
 
 import aiohttp
@@ -22,17 +20,29 @@ from sannce_aio.discovery import build_seek_request, parse_discovery_reply
 from sannce_aio.errors import AuthError
 from sannce_aio.simulator import CameraSimulator
 
+from .rtsp_fake import FakeRtspCamera
+
 pytestmark = pytest.mark.asyncio
 
 MOTION_START = ["INNER", "ALARM", "MOTIONDETECT", "0", "1"]
 MOTION_STOP = ["INNER", "ALARM", "MOTIONDETECT", "0", "0"]
-CAPS = ["light_mode", "motion", "person", "talk", "vehicle", "white_light"]
+CAPS = [
+    "light_mode",
+    "motion",
+    "person",
+    "siren",
+    "siren_on_event",
+    "speaker",
+    "vehicle",
+    "volume",
+    "white_light",
+]
 CAMERA_LINE = (
-    "ip=192.168.1.10 mac=00:00:5E:00:53:2A serial=SN0000000001 model=MODEL-X "
+    "ip=192.168.1.10 mac=00:00:5e:00:53:2a serial=SN0000000001 model=MODEL-X "
     "http_port=80 server_port=3000 channels=1"
 )
 OTHER_LINE = (
-    "ip=192.168.1.10 mac=00:00:5E:00:53:2B serial=SN0000000002 model=MODEL-X "
+    "ip=192.168.1.10 mac=00:00:5e:00:53:2b serial=SN0000000002 model=MODEL-X "
     "http_port=80 server_port=3000 channels=1"
 )
 SPAWN_TIMEOUT = 20
@@ -68,11 +78,9 @@ class EagerSimulator(CameraSimulator):
         await session.send(MOTION_START)
 
 
-class ResettingSimulator(CameraSimulator):
+class ClosingSimulator(CameraSimulator):
     async def _logon(self, session, fields):
-        sock = session.writer.get_extra_info("socket")
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        session.writer.transport.abort()
+        await session.ws.close()
 
 
 class Responder(asyncio.DatagramProtocol):
@@ -90,7 +98,7 @@ class Responder(asyncio.DatagramProtocol):
             loop.call_later(self.delay, self.transport.sendto, reply, addr)
 
 
-def probe_argv(simulator, *extra, password=None):
+def probe_argv(simulator, rtsp, *extra, password=None):
     return [
         "probe",
         simulator.host,
@@ -102,18 +110,20 @@ def probe_argv(simulator, *extra, password=None):
         str(simulator.port),
         "--http-port",
         str(simulator.http_port),
+        "--rtsp-port",
+        str(rtsp.port),
         *extra,
     ]
 
 
-def probe_args(simulator, *extra, password=None):
-    argv = probe_argv(simulator, *extra, password=password)
+def probe_args(simulator, rtsp, *extra, password=None):
+    argv = probe_argv(simulator, rtsp, *extra, password=password)
     return cli.build_parser().parse_args(argv)
 
 
-async def probe_lines(simulator, *extra):
+async def probe_lines(simulator, rtsp, *extra):
     out = io.StringIO()
-    args = probe_args(simulator, "--duration", "0", *extra)
+    args = probe_args(simulator, rtsp, "--duration", "0", *extra)
     await asyncio.wait_for(cli.run_probe(args, out), timeout=5)
     return out.getvalue().splitlines()
 
@@ -134,6 +144,14 @@ async def discover_lines(*flags, timeout=0.2):
     argv = ["discover", "--timeout", str(timeout), *flags]
     await cli.run_discover(cli.build_parser().parse_args(argv), out)
     return out.getvalue().splitlines()
+
+
+@pytest_asyncio.fixture
+async def rtsp():
+    camera = FakeRtspCamera()
+    await camera.start()
+    yield camera
+    await camera.stop()
 
 
 @pytest_asyncio.fixture
@@ -175,12 +193,13 @@ async def spawn():
 
 
 @pytest_asyncio.fixture
-async def start_probe(simulator):
+async def start_probe(simulator, rtsp):
     tasks = []
 
     def start(*extra):
         out = io.StringIO()
-        task = asyncio.create_task(cli.run_probe(probe_args(simulator, *extra), out))
+        args = probe_args(simulator, rtsp, *extra)
+        task = asyncio.create_task(cli.run_probe(args, out))
         tasks.append(task)
         return task, out
 
@@ -216,52 +235,75 @@ def camera_reply(examples):
 
 @pytest.fixture
 def other_reply(camera_reply):
-    return camera_reply.replace(b"2A:53:00:5E:00:00", b"2B:53:00:5E:00:00").replace(
+    return camera_reply.replace(b"2a:53:00:5e:00:00", b"2b:53:00:5e:00:00").replace(
         b"SN0000000001", b"SN0000000002"
     )
 
 
-async def test_probe_prints_info_and_caps(simulator):
-    lines = await probe_lines(simulator)
+async def test_probe_prints_info_and_caps(simulator, rtsp):
+    lines = await probe_lines(simulator, rtsp)
 
     assert "info: model=unknown serial=unknown firmware=1.0.0 mac=unknown" in lines
     assert "caps: " + " ".join(CAPS) in lines
 
 
 @pytest.mark.parametrize(
-    ("initial", "expected"),
-    [(0, "light: off -> on -> off"), (1, "light: on -> off -> on")],
+    ("lit", "expected"),
+    [(False, "light: off -> on -> off"), (True, "light: on -> off -> on")],
 )
-async def test_probe_toggles_the_light_and_puts_it_back(simulator, initial, expected):
-    simulator.light_control = initial
+async def test_probe_toggles_the_light_and_puts_it_back(simulator, rtsp, lit, expected):
+    if lit:
+        simulator.light_mode = 3
+        simulator.light_control = 3
+        simulator.light_on_time = "00:00:00"
+        simulator.light_off_time = "23:59:00"
+    start = (simulator.light_mode, simulator.light_control, simulator.lamp_on)
 
-    lines = await probe_lines(simulator)
+    lines = await probe_lines(simulator, rtsp)
 
     assert expected in lines
-    assert simulator.light_control == initial
+    assert (simulator.light_mode, simulator.light_control, simulator.lamp_on) == start
 
 
-async def test_probe_no_light_leaves_the_light_alone(simulator):
-    lines = await probe_lines(simulator, "--no-light")
+@pytest.mark.parametrize("control", [0, 3])
+async def test_probe_skips_the_light_in_custom_mode(simulator, rtsp, control):
+    simulator.light_mode = 4
+    simulator.light_control = control
+    simulator.light_on_time = "00:00:00"
+    simulator.light_off_time = "23:59:00"
+    start = (simulator.light_mode, simulator.light_control, simulator.lamp_on)
+
+    text = await probe_lines(simulator, rtsp)
+    as_json = [
+        json.loads(line) for line in await probe_lines(simulator, rtsp, "--json")
+    ]
+
+    assert text[text.index("light: skipped in custom mode") + 1] == "watching events"
+    assert {"type": "light", "skipped": "custom mode"} in as_json
+    assert (simulator.light_mode, simulator.light_control, simulator.lamp_on) == start
+
+
+async def test_probe_no_light_leaves_the_light_alone(simulator, rtsp):
+    lines = await probe_lines(simulator, rtsp, "--no-light")
 
     assert not [line for line in lines if line.startswith("light")]
 
 
-async def test_probe_skips_the_light_when_the_camera_has_none(start_simulator):
+async def test_probe_skips_the_light_when_the_camera_has_none(start_simulator, rtsp):
     simulator = await start_simulator(NoLightSimulator)
 
-    lines = await probe_lines(simulator)
+    lines = await probe_lines(simulator, rtsp)
 
-    assert "caps: light_mode motion person talk vehicle" in lines
+    assert "caps: " + " ".join(cap for cap in CAPS if cap != "white_light") in lines
     assert not [line for line in lines if line.startswith("light")]
 
 
 async def test_probe_reports_a_refused_light_change_and_keeps_watching(
-    start_simulator,
+    start_simulator, rtsp
 ):
     simulator = await start_simulator(RefusingSimulator)
 
-    lines = await probe_lines(simulator)
+    lines = await probe_lines(simulator, rtsp)
 
     assert len([line for line in lines if line.startswith("light: error: ")]) == 1
     assert lines[-1] == "watching events"
@@ -284,10 +326,10 @@ async def test_probe_prints_pushed_events_once_watching(simulator, start_probe):
     ]
 
 
-async def test_probe_shows_an_event_sent_right_after_login(start_simulator):
+async def test_probe_shows_an_event_sent_right_after_login(start_simulator, rtsp):
     simulator = await start_simulator(EagerSimulator)
 
-    lines = await probe_lines(simulator)
+    lines = await probe_lines(simulator, rtsp)
 
     assert "event: motion active channel=0" in lines
 
@@ -327,21 +369,23 @@ async def test_probe_closes_the_connection_when_interrupted(simulator, start_pro
     await wait_until(lambda: simulator.clients == 0)
 
 
-async def test_probe_releases_everything_when_login_fails(simulator):
+async def test_probe_releases_everything_when_login_fails(simulator, rtsp):
     leaks = []
     asyncio.get_running_loop().set_exception_handler(
         lambda _loop, context: leaks.append(context)
     )
 
     with pytest.raises(AuthError):
-        await cli.run_probe(probe_args(simulator, password="wrong"), io.StringIO())
+        await cli.run_probe(
+            probe_args(simulator, rtsp, password="wrong"), io.StringIO()
+        )
     gc.collect()
 
     assert leaks == []
 
 
-async def test_module_entry_point_runs_the_probe(simulator, spawn):
-    process = await spawn(*probe_argv(simulator, "--duration", "0"))
+async def test_module_entry_point_runs_the_probe(simulator, rtsp, spawn):
+    process = await spawn(*probe_argv(simulator, rtsp, "--duration", "0"))
 
     stdout, stderr = await asyncio.wait_for(process.communicate(), SPAWN_TIMEOUT)
 
@@ -351,8 +395,8 @@ async def test_module_entry_point_runs_the_probe(simulator, spawn):
 
 
 @pytest.mark.skipif(NO_SIGINT, reason="SIGINT cannot be delivered here")
-async def test_ctrl_c_closes_the_connection_and_exits_quietly(simulator, spawn):
-    process = await spawn(*probe_argv(simulator))
+async def test_ctrl_c_closes_the_connection_and_exits_quietly(simulator, rtsp, spawn):
+    process = await spawn(*probe_argv(simulator, rtsp))
     await asyncio.wait_for(
         read_until(process.stdout, "watching events"), SPAWN_TIMEOUT
     )
@@ -366,8 +410,9 @@ async def test_ctrl_c_closes_the_connection_and_exits_quietly(simulator, spawn):
     await wait_until(lambda: simulator.clients == 0)
 
 
-async def test_main_prints_one_error_line_when_login_fails(simulator, capsys):
-    code = await asyncio.to_thread(cli.main, probe_argv(simulator, password="wrong"))
+async def test_main_prints_one_error_line_when_login_fails(simulator, rtsp, capsys):
+    argv = probe_argv(simulator, rtsp, password="wrong")
+    code = await asyncio.to_thread(cli.main, argv)
 
     captured = capsys.readouterr()
     assert code == 1
@@ -376,24 +421,25 @@ async def test_main_prints_one_error_line_when_login_fails(simulator, capsys):
     assert captured.err.count("\n") == 1
 
 
-async def test_main_prints_one_error_line_when_the_camera_resets_the_connection(
-    start_simulator, capsys
+async def test_main_prints_one_error_line_when_the_camera_closes_the_connection(
+    start_simulator, rtsp, capsys
 ):
-    simulator = await start_simulator(ResettingSimulator)
+    simulator = await start_simulator(ClosingSimulator)
 
-    code = await asyncio.to_thread(cli.main, probe_argv(simulator))
+    code = await asyncio.to_thread(cli.main, probe_argv(simulator, rtsp))
 
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
-    assert captured.err.startswith("error: ")
-    assert os.strerror(errno.ECONNRESET) in captured.err
-    assert captured.err.count("\n") == 1
+    assert captured.err == "error: the camera closed the connection during login\n"
 
 
-async def test_a_closed_stdout_pipe_gives_one_error_line_and_exit_1(simulator, spawn):
+async def test_a_closed_stdout_pipe_gives_one_error_line_and_exit_1(
+    simulator, rtsp, spawn
+):
     read_end, write_end = os.pipe()
-    process = await spawn(*probe_argv(simulator, "--duration", "0"), stdout=write_end)
+    argv = probe_argv(simulator, rtsp, "--duration", "0")
+    process = await spawn(*argv, stdout=write_end)
     os.close(write_end)
     os.close(read_end)
 
@@ -405,16 +451,22 @@ async def test_a_closed_stdout_pipe_gives_one_error_line_and_exit_1(simulator, s
     assert lines[0].startswith("error: ")
 
 
-@pytest.mark.parametrize("flag", ["--nvs-port", "--http-port"])
+@pytest.mark.parametrize("flag", ["--nvs-port", "--http-port", "--rtsp-port"])
 @pytest.mark.parametrize("port", ["0", "65536", "70000", "abc"])
-async def test_main_exits_2_with_usage_for_a_bad_port(simulator, capsys, flag, port):
+async def test_main_exits_2_with_usage_for_a_bad_port(simulator, rtsp, capsys, flag, port):
     with pytest.raises(SystemExit) as stop:
-        await asyncio.to_thread(cli.main, probe_argv(simulator, flag, port))
+        await asyncio.to_thread(cli.main, probe_argv(simulator, rtsp, flag, port))
 
     err = capsys.readouterr().err
     assert stop.value.code == 2
     assert err.startswith("usage: python -m sannce_aio probe")
     assert f"error: argument {flag}: " in err
+
+
+async def test_probe_uses_rtsp_port_554_by_default():
+    args = cli.build_parser().parse_args(["probe", "127.0.0.1"])
+
+    assert args.rtsp_port == 554
 
 
 async def test_ports_1_and_65535_are_accepted():
@@ -448,7 +500,7 @@ async def test_discover_json_prints_one_object_per_camera(lan, camera_reply):
     assert [json.loads(line) for line in lines] == [
         {
             "ip": "192.168.1.10",
-            "mac": "00:00:5E:00:53:2A",
+            "mac": "00:00:5e:00:53:2a",
             "serial": "SN0000000001",
             "model": "MODEL-X",
             "http_port": 80,
@@ -513,6 +565,8 @@ async def simulate(monkeypatch):
     async def start(*argv):
         args = cli.build_parser().parse_args(["simulate", "--host", "127.0.0.1", *argv])
         args.nvs_port = args.http_port = args.control_port = 0
+        if args.rtsp_port is not None:
+            args.rtsp_port = 0
         out = io.StringIO()
         task = asyncio.create_task(cli.run_simulate(args, out))
         tasks.append(task)
@@ -535,10 +589,11 @@ async def test_simulate_defaults():
 
     assert (args.host, args.nvs_port, args.http_port, args.control_port) == (
         "0.0.0.0",
-        3000,
+        3002,
         80,
         8099,
     )
+    assert (args.rtsp_port, args.rtsp_upstream_port) == (None, 8554)
     assert (args.user, args.password) == ("admin", "admin123")
     assert (args.model, args.serial, args.mac) == (
         "I91FW-SIM",
@@ -559,10 +614,17 @@ async def test_simulate_rejects_a_mac_of_the_wrong_shape(capsys, mac):
 
 
 async def test_simulate_serves_the_camera_and_its_control_api(simulate):
-    _, ready = await simulate("--pass", "secret", "--model", "CAM-SIM")
+    _, ready = await simulate(
+        "--pass", "secret", "--model", "CAM-SIM", "--rtsp-port", "1"
+    )
     model, host, nvs, http, _, control = ready.groups()
     camera = SannceCamera(
-        host, "admin", "secret", nvs_port=int(nvs), http_port=int(http)
+        host,
+        "admin",
+        "secret",
+        nvs_port=int(nvs),
+        http_port=int(http),
+        rtsp_port=rtsp_port(ready),
     )
 
     try:
@@ -575,6 +637,54 @@ async def test_simulate_serves_the_camera_and_its_control_api(simulate):
 
     assert (model, host) == ("CAM-SIM", "127.0.0.1")
     assert (state["clients"], state["password"]) == (1, "secret")
+
+
+def rtsp_port(ready):
+    return int(re.search(r"rtsp (\d+)$", ready.string.strip()).group(1))
+
+
+async def test_simulate_serves_rtsp_when_asked(simulate):
+    _, ready = await simulate("--rtsp-port", "1")
+    host, control = ready.group(2), ready.group(6)
+    rtsp = rtsp_port(ready)
+
+    reader, writer = await asyncio.open_connection(host, rtsp)
+    try:
+        writer.write(b"OPTIONS rtsp://x/1/1 RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        reply = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+    finally:
+        writer.close()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://{host}:{control}/audio.wav") as response:
+            audio = response.status
+
+    assert reply.startswith(b"RTSP/1.0 401")
+    assert audio == 200
+
+
+async def test_simulate_has_no_rtsp_by_default(simulate):
+    _, ready = await simulate()
+    host, control = ready.group(2), ready.group(6)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://{host}:{control}/audio.wav") as response:
+            audio = response.status
+
+    assert "rtsp" not in ready.string
+    assert audio == 404
+
+
+async def test_simulate_closes_the_rtsp_port_when_cancelled(simulate):
+    task, ready = await simulate("--rtsp-port", "1")
+    host = ready.group(2)
+    rtsp = rtsp_port(ready)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with pytest.raises(ConnectionRefusedError):
+        await asyncio.open_connection(host, rtsp)
 
 
 async def test_simulate_answers_the_lan_search(simulate):
@@ -619,6 +729,33 @@ async def test_main_prints_one_error_line_when_a_simulate_port_is_taken(capsys):
         holder.listen()
         port = holder.getsockname()[1]
         argv = ["simulate", "--host", "127.0.0.1", "--nvs-port", str(port)]
+
+        code = await asyncio.to_thread(cli.main, argv)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.startswith("error: ")
+    assert str(port) in captured.err
+    assert captured.err.count("\n") == 1
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+async def test_main_prints_one_error_line_when_the_rtsp_port_is_taken(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "SEARCH_PORTS", (0,))
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        port = holder.getsockname()[1]
+        argv = [
+            "simulate", "--host", "127.0.0.1", "--nvs-port", str(free_port()),
+            "--http-port", str(free_port()), "--control-port", str(free_port()),
+            "--rtsp-port", str(port),
+        ]
 
         code = await asyncio.to_thread(cli.main, argv)
 

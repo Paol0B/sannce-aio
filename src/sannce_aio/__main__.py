@@ -19,6 +19,7 @@ from .simulator import (
     MAC_SHAPE,
     CameraSimulator,
 )
+from .simulator_rtsp import RtspFront
 
 _EXIT_FAILED = 1
 _EXIT_INTERRUPTED = 130
@@ -49,11 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--nvs-port",
         type=_port,
-        default=3000,
-        help="private protocol port (default: 3000)",
+        default=3002,
+        help="WebSocket port (default: 3002)",
     )
     probe.add_argument(
         "--http-port", type=_port, default=80, help="HTTP port (default: 80)"
+    )
+    probe.add_argument(
+        "--rtsp-port", type=_port, default=554, help="RTSP port (default: 554)"
     )
     probe.add_argument(
         "--duration",
@@ -87,8 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument(
         "--nvs-port",
         type=_port,
-        default=3000,
-        help="private protocol port (default: 3000)",
+        default=3002,
+        help="WebSocket port (default: 3002)",
     )
     simulate.add_argument(
         "--http-port", type=_port, default=80, help="HTTP port (default: 80)"
@@ -98,6 +102,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=_port,
         default=8099,
         help="control API port (default: 8099)",
+    )
+    simulate.add_argument(
+        "--rtsp-port",
+        type=_port,
+        help="serve RTSP with a backchannel on this port (default: off)",
+    )
+    simulate.add_argument(
+        "--rtsp-upstream-port",
+        type=_port,
+        default=8554,
+        help="local RTSP server the front relays video from (default: 8554)",
     )
     simulate.add_argument(
         "--user", default="admin", help="camera user (default: admin)"
@@ -136,6 +151,7 @@ async def run_probe(args: argparse.Namespace, out: TextIO | None = None) -> None
         args.password,
         nvs_port=args.nvs_port,
         http_port=args.http_port,
+        rtsp_port=args.rtsp_port,
     )
     # events can arrive as soon as the login ends, before connect() returns
     camera.subscribe(lambda event: _emit_event(emit, event))
@@ -178,21 +194,42 @@ async def run_simulate(args: argparse.Namespace, out: TextIO | None = None) -> N
     )
     await simulator.start()
     try:
-        control = await start_control(simulator, args.host, args.control_port)
+        front = await _start_front(args)
         try:
-            search = " ".join(str(port) for port in simulator.search_ports)
-            print(
-                f"simulating {args.model} on {args.host}: nvs {simulator.port}, "
-                f"http {simulator.http_port}, search {search}, "
-                f"control {control.addresses[0][1]}",
-                file=stream,
-                flush=True,
-            )
-            await asyncio.Event().wait()
+            control = await start_control(simulator, args.host, args.control_port, front)
+            try:
+                search = " ".join(str(port) for port in simulator.search_ports)
+                rtsp = f", rtsp {front.port}" if front else ""
+                print(
+                    f"simulating {args.model} on {args.host}: nvs {simulator.port}, "
+                    f"http {simulator.http_port}, search {search}, "
+                    f"control {control.addresses[0][1]}{rtsp}",
+                    file=stream,
+                    flush=True,
+                )
+                await asyncio.Event().wait()
+            finally:
+                await control.cleanup()
         finally:
-            await control.cleanup()
+            if front:
+                await front.stop()
     finally:
         await simulator.stop()
+
+
+async def _start_front(args: argparse.Namespace) -> RtspFront | None:
+    if args.rtsp_port is None:
+        return None
+    front = RtspFront(
+        host=args.host,
+        port=args.rtsp_port,
+        upstream_host="127.0.0.1",
+        upstream_port=args.rtsp_upstream_port,
+        username=args.user,
+        password=args.password,
+    )
+    await front.start()
+    return front
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -230,7 +267,12 @@ def _emit_event(emit: _Emit, event: Event) -> None:
 
 async def _toggle_light(camera: SannceCamera, emit: _Emit) -> None:
     try:
-        before, toggled, restored = await _toggle_and_restore(camera)
+        mode = await camera.get_light_mode()
+        # the library cannot set custom mode back once the probe leaves it
+        if mode == "custom":
+            emit({"type": "light", "skipped": "custom mode"}, "light: skipped in custom mode")
+            return
+        before, toggled, restored = await _toggle_and_restore(camera, mode)
     except SannceError as exc:
         emit({"type": "light", "error": str(exc)}, f"light: error: {exc}")
         return
@@ -241,14 +283,14 @@ async def _toggle_light(camera: SannceCamera, emit: _Emit) -> None:
     )
 
 
-async def _toggle_and_restore(camera: SannceCamera) -> tuple[bool, bool, bool]:
-    before = await camera.get_light()
+async def _toggle_and_restore(camera: SannceCamera, mode: str) -> tuple[bool, bool, bool]:
+    before = (await camera.get_floodlight()).on
     try:
-        await camera.set_light(not before)
-        toggled = await camera.get_light()
+        await camera.set_floodlight(not before, base_mode=mode)
+        toggled = (await camera.get_floodlight()).on
     finally:
-        await camera.set_light(before)
-    return before, toggled, await camera.get_light()
+        await camera.set_floodlight(before, base_mode=mode)
+    return before, toggled, (await camera.get_floodlight()).on
 
 
 async def _wait(duration: float | None) -> None:

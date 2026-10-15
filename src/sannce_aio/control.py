@@ -2,18 +2,23 @@ from typing import Any
 
 from aiohttp import web
 
-from .http import AUTO, MANUAL_ON, MODE_NAMES, MODE_VALUES
-from .simulator import CameraSimulator, event_fields
+from .http import ALWAYS_ON_FROM, ALWAYS_ON_UNTIL, AUTO, MODE_NAMES, MODE_VALUES, TIMED
+from .simulator import CameraSimulator
+from .simulator_rtsp import RtspFront
 
 _SIMULATOR = web.AppKey("simulator", CameraSimulator)
+_FRONT = web.AppKey[RtspFront | None]("front")
 _DETECTION = ("person", "vehicle", "motion")
-_SETTINGS = {"light", "light_mode", "detection"}
+_SETTINGS = {"light", "light_mode", "detection", "volume"}
 _MAX_DROP_SECONDS = 3600
 
 
-def control_app(simulator: CameraSimulator) -> web.Application:
+def control_app(
+    simulator: CameraSimulator, front: RtspFront | None = None
+) -> web.Application:
     app = web.Application()
     app[_SIMULATOR] = simulator
+    app[_FRONT] = front
     app.add_routes(
         [
             web.get("/state", _state),
@@ -30,9 +35,9 @@ def control_app(simulator: CameraSimulator) -> web.Application:
 
 
 async def start_control(
-    simulator: CameraSimulator, host: str, port: int
+    simulator: CameraSimulator, host: str, port: int, front: RtspFront | None = None
 ) -> web.AppRunner:
-    runner = web.AppRunner(control_app(simulator), access_log=None)
+    runner = web.AppRunner(control_app(simulator, front), access_log=None)
     await runner.setup()
     try:
         await web.TCPSite(runner, host, port).start()
@@ -44,13 +49,18 @@ async def start_control(
 
 async def _state(request: web.Request) -> web.Response:
     simulator = request.app[_SIMULATOR]
+    front = request.app[_FRONT]
     return web.json_response(
         {
-            "light": simulator.light_control == MANUAL_ON,
+            "light": simulator.lamp_on,
+            "light_power": simulator.light_power,
             "light_mode": MODE_NAMES.get(simulator.light_mode),
-            "detection": dict(simulator.detection),
+            "detection": dict(simulator.detection) | {"sensitivity": simulator.sensitivity},
+            "sounds": [list(sound) for sound in simulator.sounds],
+            "volume": simulator.volume,
+            "siren_on_event": simulator.siren_on_event,
             "clients": simulator.clients,
-            "talking": simulator.talking,
+            "talking": front.speaking if front else False,
             "user": simulator.username,
             "password": simulator.password,
         }
@@ -59,18 +69,24 @@ async def _state(request: web.Request) -> web.Response:
 
 async def _event(request: web.Request) -> web.Response:
     body = await _body(request)
+    kind, active = _text(body, "kind"), _flag(body, "active")
+    simulator = request.app[_SIMULATOR]
     try:
-        fields = event_fields(_text(body, "kind"), _flag(body, "active"))
+        if active:
+            await simulator.start_alarm(kind)
+        else:
+            await simulator.stop_alarm(kind)
     except ValueError as err:
         raise web.HTTPBadRequest(text=str(err)) from None
-    await request.app[_SIMULATOR].push_event(fields)
     return web.Response(status=204)
 
 
 async def _settings(request: web.Request) -> web.Response:
     body = await _body(request)
     if not body or not set(body) <= _SETTINGS:
-        raise web.HTTPBadRequest(text="settings take light, light_mode and detection")
+        raise web.HTTPBadRequest(
+            text="settings take light, light_mode, detection and volume"
+        )
     light = _flag(body, "light") if "light" in body else None
     mode = None
     if "light_mode" in body:
@@ -81,17 +97,29 @@ async def _settings(request: web.Request) -> web.Response:
     if not isinstance(detection, dict) or not set(detection) <= set(_DETECTION):
         raise web.HTTPBadRequest(text="detection takes person, vehicle and motion")
     changes = {name: _flag(detection, name) for name in detection}
+    volume = _volume(body) if "volume" in body else None
     simulator = request.app[_SIMULATOR]
-    if light is not None:
-        simulator.light_control = MANUAL_ON if light else AUTO
+    if light is True:
+        simulator.light_mode = MODE_VALUES["color"]
+        simulator.light_control = TIMED
+        simulator.light_on_time = ALWAYS_ON_FROM
+        simulator.light_off_time = ALWAYS_ON_UNTIL
+    elif light is False:
+        simulator.light_control = AUTO
     if mode is not None:
         simulator.light_mode = mode
+    if volume is not None:
+        simulator.volume = volume
     simulator.detection.update(changes)
     return web.Response(status=204)
 
 
 async def _password(request: web.Request) -> web.Response:
-    request.app[_SIMULATOR].password = _text(await _body(request), "password")
+    password = _text(await _body(request), "password")
+    request.app[_SIMULATOR].password = password
+    front = request.app[_FRONT]
+    if front:
+        front.password = password
     return web.Response(status=204)
 
 
@@ -111,19 +139,28 @@ async def _drop(request: web.Request) -> web.Response:
 
 
 async def _talk_busy(request: web.Request) -> web.Response:
-    request.app[_SIMULATOR].set_talk_busy(_flag(await _body(request), "busy"))
+    front = _front(request)
+    front.busy = _flag(await _body(request), "busy")
     return web.Response(status=204)
 
 
 async def _audio(request: web.Request) -> web.Response:
-    return web.Response(
-        body=request.app[_SIMULATOR].talk_wav(), content_type="audio/wav"
-    )
+    return web.Response(body=_front(request).wav(), content_type="audio/wav")
 
 
 async def _reset(request: web.Request) -> web.Response:
     await request.app[_SIMULATOR].reset()
+    front = request.app[_FRONT]
+    if front:
+        front.reset()
     return web.Response(status=204)
+
+
+def _front(request: web.Request) -> RtspFront:
+    front = request.app[_FRONT]
+    if front is None:
+        raise web.HTTPNotFound(text="no RTSP front")
+    return front
 
 
 async def _body(request: web.Request) -> dict[str, Any]:
@@ -140,6 +177,14 @@ def _flag(body: dict[str, Any], name: str) -> bool:
     value = body.get(name)
     if not isinstance(value, bool):
         raise web.HTTPBadRequest(text=f"{name} is true or false")
+    return value
+
+
+def _volume(body: dict[str, Any]) -> int:
+    value = body["volume"]
+    # bool is an int: refuse true and false
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        raise web.HTTPBadRequest(text="volume is a whole number from 0 to 100")
     return value
 
 

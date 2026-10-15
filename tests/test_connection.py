@@ -1,38 +1,30 @@
 import asyncio
+import base64
+import hashlib
 import logging
-import socket
-import struct
 
+import aiohttp
 import pytest
+from aiohttp import WSMsgType, web
 
 from sannce_aio.connection import NvsConnection
 from sannce_aio.errors import AuthError, ConnectError
 from sannce_aio.events import Event
-from sannce_aio.login import PlaintextLogin
-from sannce_aio.protocol import build_command, parse_frame
+from sannce_aio.login import SaltedLogin
+from sannce_aio.protocol import build_command, encode_fields, pack_command, parse_frame
+from sannce_aio.transport import WsTransport
 
 DEVICE_IP = "192.168.1.10"
+SALT = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+
+
+def salted(value):
+    return base64.b64encode(hashlib.md5(value.encode() + SALT).digest()).decode()
 
 
 def event_frame(channel):
     fields = [DEVICE_IP, "IP", "INNER", "ALARM", "MOTIONDETECT", str(channel), "1"]
     return build_command(fields, 0)
-
-
-def reset(writer):
-    sock = writer.get_extra_info("socket")
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    writer.transport.abort()
-
-
-class ChunkReader:
-    def __init__(self, chunks):
-        self._chunks = list(chunks)
-
-    async def read(self, _size):
-        if self._chunks:
-            return self._chunks.pop(0)
-        return b""
 
 
 class FakeCamera:
@@ -42,105 +34,116 @@ class FakeCamera:
         reply_to_requests=True,
         finish_login=True,
         reject_reconnect=False,
-        reset_login=False,
+        refuse_login=False,
+        answer_md5=True,
+        login_payload=None,
+        reply_tail=b"",
     ):
         self._reply_to_requests = reply_to_requests
         self._finish_login = finish_login
         self._reject_reconnect = reject_reconnect
-        self.reset_login = reset_login
-        self._server = None
-        self._writer = None
-        self._seq = 0
+        self.refuse_login = refuse_login
+        self.answer_md5 = answer_md5
+        self._login_payload = login_payload
+        self._reply_tail = reply_tail
+        self.close_logins = 0
+        self._runner = None
+        self._ws = None
         self.port = None
         self.connections = 0
         self.heartbeats = 0
         self.requests = []
+        self.logons = []
 
     async def start(self):
-        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
-        self.port = self._server.sockets[0].getsockname()[1]
+        app = web.Application()
+        app.router.add_get("/", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "127.0.0.1", 0).start()
+        self.port = self._runner.addresses[0][1]
 
     async def stop(self):
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        await self._runner.cleanup()
 
     async def drop_client(self):
-        writer = self._writer
-        self._writer = None
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            await ws.close()
 
-    async def _handle(self, reader, writer):
+    async def send(self, fields):
+        await self._ws.send_bytes(build_command(fields, 0))
+
+    async def send_raw(self, data):
+        await self._ws.send_bytes(data)
+
+    async def _handle(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
         self.connections += 1
-        self._writer = writer
+        self._ws = ws
         buffer = bytearray()
-        try:
+        async for msg in ws:
+            if msg.type is not WSMsgType.BINARY:
+                continue
+            buffer += msg.data
             while True:
-                while True:
-                    frame, consumed = parse_frame(bytes(buffer))
-                    if frame is None:
-                        break
-                    del buffer[:consumed]
-                    await self._react(frame, writer)
-                chunk = await reader.read(0x10000)
-                if not chunk:
+                frame, consumed = parse_frame(bytes(buffer))
+                if frame is None:
                     break
-                buffer += chunk
-        except (OSError, ConnectionError):
-            pass
-        finally:
-            writer.close()
+                del buffer[:consumed]
+                await self._react(frame, ws)
+        return ws
 
-    async def _react(self, frame, writer):
-        fields = frame.fields
-        if not fields:
+    async def _react(self, frame, ws):
+        if not frame.commands:
             self.heartbeats += 1
             return
+        [fields] = frame.commands
         if fields[2:4] == ["USER", "LOGON"]:
-            if self.reset_login:
-                reset(writer)
-                return
-            await self._send(writer, ["INNER", "CMDID", "7"])
-            if self._should_finish_login():
-                await self._send(writer, ["INNER", "LOGON", "FINISHED"])
+            await self._logon(fields, ws)
             return
         self.requests.append(fields)
         if self._reply_to_requests:
             session_id = fields[-1]
-            reply = ["INNER", "CMD", "GETPARAM", "FINISHED", session_id, "0"]
-            await self._send(writer, reply)
+            reply = [DEVICE_IP, "IP", "INNER", "CMD", "GETPARAM", "FINISHED", session_id, "0"]
+            await ws.send_bytes(pack_command(encode_fields(reply) + self._reply_tail, 0))
 
-    def _should_finish_login(self):
-        if not self._finish_login:
-            return False
-        # reconnect attempts never finish, so the client times out into AuthError
-        return not (self._reject_reconnect and self.connections > 1)
+    async def _logon(self, fields, ws):
+        self.logons.append(fields)
+        if self.close_logins:
+            self.close_logins -= 1
+            await ws.close()
+            return
+        salt = base64.b64encode(SALT).decode()
+        if fields[9] != "0":
+            refusal = ["INNER", "USER", "LOGONFAILED", "3", "1", "1", salt, "0", "0"]
+            await ws.send_bytes(build_command([DEVICE_IP, "IP", *refusal], 0))
+            return
+        if not self.answer_md5:
+            return
+        if self.refuse_login or self._should_reject():
+            refusal = ["INNER", "USER", "LOGONFAILED", "2", "1", "1", salt, "1", "0"]
+            await ws.send_bytes(build_command([DEVICE_IP, "IP", *refusal], 0))
+            return
+        if self._login_payload is not None:
+            await ws.send_bytes(pack_command(self._login_payload, 0))
+            return
+        await ws.send_bytes(build_command([DEVICE_IP, "IP", "INNER", "CMDID", "7"], 0))
+        if self._finish_login:
+            await ws.send_bytes(build_command([DEVICE_IP, "IP", "INNER", "LOGON", "FINISHED"], 0))
 
-    async def push_event(self, channel):
-        writer = self._writer
-        if writer is not None:
-            await self._send(writer, ["INNER", "ALARM", "MOTIONDETECT", str(channel), "1"])
-
-    async def _send(self, writer, inner):
-        writer.write(build_command([DEVICE_IP, "IP", *inner], self._seq))
-        self._seq = (self._seq + 1) % 0x10000
-        await writer.drain()
+    def _should_reject(self):
+        return self._reject_reconnect and self.connections > 1
 
 
-def make_connection(camera, *, events=None, availability=None, **kwargs):
+def make(camera, *, events=None, availability=None, **kwargs):
     return NvsConnection(
         "127.0.0.1",
         camera.port,
-        PlaintextLogin(DEVICE_IP),
-        on_event=(events.append if events is not None else (lambda _event: None)),
-        on_availability=(
-            availability.append if availability is not None else (lambda _state: None)
-        ),
+        SaltedLogin("127.0.0.1"),
+        on_event=events or (lambda _event: None),
+        on_availability=availability or (lambda _state: None),
         **kwargs,
     )
 
@@ -155,22 +158,23 @@ async def wait_until(predicate, timeout=3.0):
     raise AssertionError("condition was not met in time")
 
 
-@pytest.mark.asyncio
 async def test_feed_split_and_merged_frames():
+    camera = FakeCamera()
+    await camera.start()
     events = []
-    conn = NvsConnection(
-        "127.0.0.1",
-        3000,
-        PlaintextLogin(DEVICE_IP),
-        on_event=events.append,
-        on_availability=lambda _state: None,
-    )
-    frame_a = event_frame(0)
-    split = len(frame_a) // 2
-    conn._reader = ChunkReader(
-        [frame_a[:split], frame_a[split:], event_frame(1) + event_frame(2)]
-    )
-    await conn._receive_loop()
+    conn = make(camera, events=events.append)
+    try:
+        await conn.connect("admin", "admin123")
+        await camera.send_raw(event_frame(0) + event_frame(1))
+        frame = event_frame(2)
+        split = len(frame) // 2
+        await camera.send_raw(frame[:split])
+        await camera.send_raw(frame[split:])
+        await wait_until(lambda: len(events) == 3)
+    finally:
+        await conn.close()
+        await camera.stop()
+
     assert events == [
         Event("motion", True, 0),
         Event("motion", True, 1),
@@ -178,14 +182,13 @@ async def test_feed_split_and_merged_frames():
     ]
 
 
-@pytest.mark.asyncio
 async def test_reconnect_on_drop():
     camera = FakeCamera()
     await camera.start()
     availability = []
-    conn = make_connection(
+    conn = make(
         camera,
-        availability=availability,
+        availability=availability.append,
         heartbeat_interval=0.05,
         backoff_start=0.01,
         backoff_max=0.05,
@@ -202,11 +205,10 @@ async def test_reconnect_on_drop():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_request_fails_when_disconnected():
     camera = FakeCamera(reply_to_requests=False)
     await camera.start()
-    conn = make_connection(
+    conn = make(
         camera,
         heartbeat_interval=0.05,
         backoff_start=0.01,
@@ -227,13 +229,10 @@ async def test_request_fails_when_disconnected():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_sent_after_connect():
     camera = FakeCamera()
     await camera.start()
-    conn = make_connection(
-        camera, heartbeat_interval=0.05, backoff_start=0.01, backoff_max=0.05
-    )
+    conn = make(camera, heartbeat_interval=0.05, backoff_start=0.01, backoff_max=0.05)
     try:
         await conn.connect("admin", "admin123")
         await wait_until(lambda: camera.heartbeats >= 1, timeout=2.0)
@@ -242,11 +241,10 @@ async def test_heartbeat_sent_after_connect():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_request_returns_matching_reply():
     camera = FakeCamera()
     await camera.start()
-    conn = make_connection(camera, heartbeat_interval=1.0)
+    conn = make(camera, heartbeat_interval=1.0)
     try:
         await conn.connect("admin", "admin123")
         reply = await conn.request([DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0"])
@@ -257,11 +255,10 @@ async def test_request_returns_matching_reply():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_request_times_out_as_connect_error():
     camera = FakeCamera(reply_to_requests=False)
     await camera.start()
-    conn = make_connection(camera, heartbeat_interval=1.0, request_timeout=30.0)
+    conn = make(camera, heartbeat_interval=1.0, request_timeout=30.0)
     try:
         await conn.connect("admin", "admin123")
         pending = conn.request(
@@ -274,38 +271,35 @@ async def test_request_times_out_as_connect_error():
         await camera.stop()
 
 
-@pytest.mark.asyncio
-async def test_connect_times_out_as_auth_error():
+async def test_connect_times_out_as_connect_error():
     camera = FakeCamera(finish_login=False)
     await camera.start()
-    conn = make_connection(camera, login_timeout=0.2)
+    conn = make(camera, login_timeout=0.2)
     try:
-        with pytest.raises(AuthError):
+        with pytest.raises(ConnectError, match="timeout"):
             await conn.connect("admin", "admin123")
     finally:
         await conn.close()
         await camera.stop()
 
 
-@pytest.mark.asyncio
-async def test_connect_reports_a_reset_during_login_as_connect_error():
-    camera = FakeCamera(reset_login=True)
+async def test_connect_reports_a_close_during_login_as_connect_error():
+    camera = FakeCamera()
+    camera.close_logins = 1
     await camera.start()
-    conn = make_connection(camera)
+    conn = make(camera)
     try:
-        with pytest.raises(ConnectError) as raised:
+        with pytest.raises(ConnectError, match="closed the connection during login"):
             await conn.connect("admin", "admin123")
-        assert isinstance(raised.value.__cause__, ConnectionError)
     finally:
         await conn.close()
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_connect_rejects_oversized_credentials():
     camera = FakeCamera()
     await camera.start()
-    conn = make_connection(camera)
+    conn = make(camera)
     try:
         with pytest.raises(AuthError):
             await conn.connect("admin", "x" * 17)
@@ -314,14 +308,13 @@ async def test_connect_rejects_oversized_credentials():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_reconnect_gives_up_after_repeated_auth_failure():
     camera = FakeCamera(reject_reconnect=True)
     await camera.start()
     availability = []
-    conn = make_connection(
+    conn = make(
         camera,
-        availability=availability,
+        availability=availability.append,
         heartbeat_interval=0.05,
         backoff_start=0.01,
         backoff_max=0.02,
@@ -341,12 +334,11 @@ async def test_reconnect_gives_up_after_repeated_auth_failure():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_reconnect_give_up_reports_the_auth_error_once():
     camera = FakeCamera(reject_reconnect=True)
     await camera.start()
     failures = []
-    conn = make_connection(
+    conn = make(
         camera,
         on_login_failed=failures.append,
         heartbeat_interval=0.05,
@@ -366,29 +358,58 @@ async def test_reconnect_give_up_reports_the_auth_error_once():
         await camera.stop()
 
 
-@pytest.mark.asyncio
-async def test_reconnect_keeps_retrying_after_a_reset_during_login():
+async def test_reconnect_keeps_retrying_after_closes_during_login():
     camera = FakeCamera()
     await camera.start()
     availability = []
-    conn = make_connection(
-        camera, availability=availability, backoff_start=0.01, backoff_max=0.02
+    failures = []
+    conn = make(
+        camera,
+        availability=availability.append,
+        on_login_failed=failures.append,
+        backoff_start=0.01,
+        backoff_max=0.02,
+        auth_failure_limit=3,
     )
     try:
         await conn.connect("admin", "admin123")
-        camera.reset_login = True
+        camera.close_logins = 5
         await camera.drop_client()
-        await wait_until(lambda: camera.connections >= 3)
-        assert not conn._run_task.done()
 
-        camera.reset_login = False
         await wait_until(lambda: availability == [True, False, True])
+        assert camera.connections == 7
+        assert not conn._run_task.done()
+        assert failures == []
     finally:
         await conn.close()
         await camera.stop()
 
 
-@pytest.mark.asyncio
+async def test_reconnect_keeps_retrying_after_login_timeouts():
+    camera = FakeCamera()
+    await camera.start()
+    failures = []
+    conn = make(
+        camera,
+        on_login_failed=failures.append,
+        backoff_start=0.01,
+        backoff_max=0.02,
+        login_timeout=0.1,
+        auth_failure_limit=3,
+    )
+    try:
+        await conn.connect("admin", "admin123")
+        camera.answer_md5 = False
+        await camera.drop_client()
+
+        await wait_until(lambda: camera.connections >= 6, timeout=5.0)
+        assert not conn._run_task.done()
+        assert failures == []
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
 async def test_event_callback_error_does_not_kill_receive_loop():
     camera = FakeCamera()
     await camera.start()
@@ -399,21 +420,19 @@ async def test_event_callback_error_does_not_kill_receive_loop():
         received.append(event)
         raise RuntimeError("callback boom")
 
-    conn = NvsConnection(
-        "127.0.0.1",
-        camera.port,
-        PlaintextLogin(DEVICE_IP),
-        on_event=on_event,
-        on_availability=availability.append,
+    conn = make(
+        camera,
+        events=on_event,
+        availability=availability.append,
         heartbeat_interval=0.05,
         backoff_start=0.01,
         backoff_max=0.05,
     )
     try:
         await conn.connect("admin", "admin123")
-        await camera.push_event(0)
+        await camera.send_raw(event_frame(0))
         await wait_until(lambda: len(received) == 1)
-        await camera.push_event(1)
+        await camera.send_raw(event_frame(1))
         await wait_until(lambda: len(received) == 2)
         assert received == [Event("motion", True, 0), Event("motion", True, 1)]
         await camera.drop_client()
@@ -423,7 +442,6 @@ async def test_event_callback_error_does_not_kill_receive_loop():
         await camera.stop()
 
 
-@pytest.mark.asyncio
 async def test_availability_callback_error_does_not_break_connect():
     camera = FakeCamera()
     await camera.start()
@@ -431,14 +449,7 @@ async def test_availability_callback_error_does_not_break_connect():
     def on_availability(_state):
         raise RuntimeError("availability boom")
 
-    conn = NvsConnection(
-        "127.0.0.1",
-        camera.port,
-        PlaintextLogin(DEVICE_IP),
-        on_event=lambda _event: None,
-        on_availability=on_availability,
-        heartbeat_interval=1.0,
-    )
+    conn = make(camera, availability=on_availability, heartbeat_interval=1.0)
     try:
         await conn.connect("admin", "admin123")
         assert conn._available is True
@@ -457,21 +468,18 @@ def connection_log(caplog):
     ]
 
 
-@pytest.mark.asyncio
 async def test_reconnect_retries_and_the_return_log_at_debug(caplog):
     caplog.set_level(logging.DEBUG, logger="sannce_aio.connection")
     camera = FakeCamera()
     await camera.start()
     availability = []
-    conn = make_connection(
-        camera, availability=availability, backoff_start=0.01, backoff_max=0.02
+    conn = make(
+        camera, availability=availability.append, backoff_start=0.01, backoff_max=0.02
     )
     try:
         await conn.connect("admin", "admin123")
-        camera.reset_login = True
+        camera.close_logins = 3
         await camera.drop_client()
-        await wait_until(lambda: camera.connections >= 4)
-        camera.reset_login = False
         await wait_until(lambda: availability == [True, False, True])
     finally:
         await conn.close()
@@ -479,17 +487,16 @@ async def test_reconnect_retries_and_the_return_log_at_debug(caplog):
 
     log = connection_log(caplog)
     retries = [text for _, text in log if text.startswith("reconnect failed")]
-    assert len(retries) >= 2
+    assert len(retries) == 3
     assert any(text.startswith("reconnected to 127.0.0.1:") for _, text in log)
     assert {level for level, _ in log} == {logging.DEBUG}
 
 
-@pytest.mark.asyncio
 async def test_refused_reconnect_logins_log_at_debug_until_the_give_up(caplog):
     caplog.set_level(logging.DEBUG, logger="sannce_aio.connection")
     camera = FakeCamera(reject_reconnect=True)
     await camera.start()
-    conn = make_connection(
+    conn = make(
         camera,
         heartbeat_interval=0.05,
         backoff_start=0.01,
@@ -510,5 +517,205 @@ async def test_refused_reconnect_logins_log_at_debug_until_the_give_up(caplog):
     assert attempts == [logging.DEBUG, logging.DEBUG]
     assert [text for level, text in log if level > logging.DEBUG] == [
         "giving up reconnect after 3 auth failures: "
-        "login did not finish before the timeout"
+        "the camera refused the login (reason 2)"
     ]
+
+
+async def test_login_sends_base64_then_md5_logon():
+    camera = FakeCamera()
+    await camera.start()
+    conn = make(camera)
+    try:
+        await conn.connect("admin", "secret")
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert [fields[9] for fields in camera.logons] == ["805306367", "0"]
+    assert camera.logons[1][4:6] == [salted("admin"), salted("secret")]
+
+
+async def test_a_refused_md5_login_raises_auth_error():
+    camera = FakeCamera(refuse_login=True)
+    await camera.start()
+    conn = make(camera)
+    try:
+        with pytest.raises(AuthError, match="reason 2"):
+            await conn.connect("admin", "secret")
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+async def test_an_unanswered_md5_login_times_out_as_connect_error():
+    camera = FakeCamera(answer_md5=False)
+    await camera.start()
+    conn = make(camera, login_timeout=0.3)
+    try:
+        with pytest.raises(ConnectError, match="timeout"):
+            await asyncio.wait_for(conn.connect("admin", "secret"), 2.0)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+
+async def test_a_silent_socket_is_dropped_after_the_idle_timeout():
+    camera = FakeCamera()
+    await camera.start()
+    states = []
+    conn = make(camera, availability=states.append, idle_timeout=0.3, heartbeat_interval=10)
+    try:
+        await conn.connect("admin", "secret")
+        await wait_until(lambda: camera.connections == 2, timeout=3)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert states[:3] == [True, False, True]
+
+
+async def test_heartbeat_runs_every_interval():
+    camera = FakeCamera()
+    await camera.start()
+    conn = make(camera, heartbeat_interval=0.05)
+    try:
+        await conn.connect("admin", "secret")
+        await asyncio.sleep(0.3)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert camera.heartbeats >= 3
+
+
+async def test_proxy_route_alarm_with_an_id_reaches_on_event():
+    camera = FakeCamera()
+    await camera.start()
+    events = []
+    conn = make(camera, events=events.append)
+    try:
+        await conn.connect("admin", "secret")
+        await camera.send([DEVICE_IP, "PROXY", "INNER", "ALARM", "MOTIONDETECT", "0", "1", "0012310019100435"])
+        await camera.send([DEVICE_IP, "PROXY", "INNER", "CMD", "EXCEPTION", "0", "0"])
+        await camera.send([DEVICE_IP, "PROXY", ""])
+        await wait_until(lambda: events)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert events == [Event("motion", True, 0)]
+
+
+async def test_an_alarm_with_the_terminator_twice_reaches_on_event():
+    camera = FakeCamera()
+    await camera.start()
+    events = []
+    conn = make(camera, events=events.append)
+    try:
+        await conn.connect("admin", "secret")
+        await camera.send_raw(
+            pack_command(
+                b"192.168.1.10\tPROXY\tINNER\tALARM\tMOTIONDETECT\t0\t1\t0012310019100435"
+                b"\n\n\n\n\n\n",
+                0,
+            )
+        )
+        await wait_until(lambda: events)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert events == [Event("motion", True, 0)]
+
+
+async def test_two_alarms_in_one_frame_reach_on_event_in_order():
+    camera = FakeCamera()
+    await camera.start()
+    events = []
+    conn = make(camera, events=events.append)
+    try:
+        await conn.connect("admin", "secret")
+        await camera.send_raw(
+            pack_command(
+                b"192.168.1.10\tPROXY\tINNER\tALARM\tMOTIONDETECT\t0\t1\t0012310019100435"
+                b"\n\n\n\n\n\n"
+                b"INNER\tALARM\tMOTIONDETECT\t0\t0\t0012310019100435\n\n\n\n\n\n",
+                0,
+            )
+        )
+        await wait_until(lambda: len(events) == 2)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert events == [Event("motion", True, 0), Event("motion", False, 0)]
+
+
+async def test_a_reply_and_an_alarm_in_one_frame_both_arrive():
+    camera = FakeCamera(reply_tail=b"INNER\tALARM\tMOTIONDETECT\t0\t1\n\n\n")
+    await camera.start()
+    events = []
+    conn = make(camera, events=events.append, request_timeout=1.0)
+    try:
+        await conn.connect("admin", "secret")
+        reply = await conn.request([DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0"])
+        await wait_until(lambda: events)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert reply[2:6] == ["INNER", "CMD", "GETPARAM", "FINISHED"]
+    assert events == [Event("motion", True, 0)]
+
+
+async def test_a_login_frame_with_cmdid_and_logon_finished_finishes_the_login():
+    camera = FakeCamera(
+        login_payload=b"192.168.1.10\tIP\tINNER\tCMDID\t7\n\n\nINNER\tLOGON\tFINISHED\n\n\n"
+    )
+    await camera.start()
+    availability = []
+    conn = make(camera, availability=availability.append, login_timeout=1.0)
+    try:
+        await conn.connect("admin", "secret")
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert availability == [True, False]
+
+
+async def test_an_alarm_after_logon_finished_in_the_same_frame_reaches_on_event():
+    camera = FakeCamera(
+        login_payload=(
+            b"192.168.1.10\tIP\tINNER\tLOGON\tFINISHED\n\n\n"
+            b"INNER\tALARM\tMOTIONDETECT\t0\t1\n\n\n"
+        )
+    )
+    await camera.start()
+    events = []
+    conn = make(camera, events=events.append, login_timeout=1.0)
+    try:
+        await conn.connect("admin", "secret")
+        await wait_until(lambda: events)
+    finally:
+        await conn.close()
+        await camera.stop()
+
+    assert events == [Event("motion", True, 0)]
+
+
+class BrokenSocket:
+    async def receive(self):
+        raise aiohttp.ClientConnectionError("reset by peer")
+
+    async def send_bytes(self, data):
+        raise ConnectionResetError("reset by peer")
+
+
+async def test_a_failing_receive_reads_as_closed():
+    assert await WsTransport(BrokenSocket()).read() == b""
+
+
+async def test_a_failing_send_raises_connect_error():
+    with pytest.raises(ConnectError, match="send failed: reset by peer"):
+        await WsTransport(BrokenSocket()).write(b"\x00")

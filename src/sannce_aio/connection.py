@@ -1,38 +1,27 @@
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Callable
 from typing import TypeVar
 
-from .audio import G711A, SUBFRAME_PCM_BYTES, frame_talk_audio
-from .errors import AuthError, ConnectError, ProtocolError, TalkBusyError
+import aiohttp
+
+from .errors import AuthError, ConnectError, ProtocolError
 from .events import Event, parse_event
 from .login import LoginStep
 from .protocol import Frame, build_command, parse_frame
+from .transport import WsTransport
 
 _log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_READ_SIZE = 0x10000
 _MAX_BUFFER = 0x10000
 _SEQ_WRAP = 0x10000
 _SESSION_ID_WRAP = 999
 _FINISHED = "FINISHED"
 # camera messages lead with device ip and route (protocol.md, Field lists)
 _ALARM_HEAD = ["INNER", "ALARM"]
-_TALK_HEAD = ["INNER", "NVR"]
-# indexes of BEGIN/END and OK/ERROR: 6 and 7 from INNER, plus the ip and route
-# (protocol.md, Request, accept and refuse)
-_TALK_ACTION = 8
-_TALK_RESULT = 9
-_TALK_ROUTE = "NVR"
-_BEGIN = "BEGIN"
-_END = "END"
-_OK = "OK"
-# audio.frame_talk_audio only builds channel 0 payloads
-_TALK_CHANNEL = 0
-_TALK_CODEC = G711A
-_DATA_SEQ_WRAP = 0x100000000
 
 
 class NvsConnection:
@@ -45,8 +34,10 @@ class NvsConnection:
         on_event: Callable[[Event], None],
         on_availability: Callable[[bool], None],
         on_login_failed: Callable[[AuthError], None] | None = None,
+        session: aiohttp.ClientSession | None = None,
         request_timeout: float = 10.0,
-        heartbeat_interval: float = 3.0,
+        heartbeat_interval: float = 5.0,
+        idle_timeout: float = 20.0,
         login_timeout: float = 10.0,
         backoff_start: float = 1.0,
         backoff_max: float = 60.0,
@@ -60,19 +51,18 @@ class NvsConnection:
         self._on_login_failed = on_login_failed
         self._request_timeout = request_timeout
         self._heartbeat_interval = heartbeat_interval
+        self._idle_timeout = idle_timeout
         self._login_timeout = login_timeout
         self._backoff_start = backoff_start
         self._backoff_max = backoff_max
         self._auth_failure_limit = auth_failure_limit
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
+        self._session = session
+        self._owns_session = session is None
+        self._transport: WsTransport | None = None
         self._rx_buffer = bytearray()
+        self._commands: deque[list[str]] = deque()
         self._pending: dict[int, asyncio.Future[list[str]]] = {}
-        self._talk_pending: dict[str, asyncio.Future[list[str]]] = {}
-        self._talk_lock = asyncio.Lock()
-        self._talking = False
         self._seq = 0
-        self._audio_seq = 0
         self._session_id = 1
         self._available = False
         self._closing = False
@@ -98,42 +88,6 @@ class NvsConnection:
         message = [*fields, str(session_id)]
         return await self._exchange(self._pending, session_id, message, timeout)
 
-    async def start_talk(self, channel: int) -> None:
-        if channel != _TALK_CHANNEL:
-            raise ValueError(
-                f"talk supports wire channel {_TALK_CHANNEL}, not {channel}"
-            )
-        async with self._talk_lock:
-            if self._talking:
-                raise TalkBusyError("talk is already active on this connection")
-            reply = await self._talk_exchange(_BEGIN)
-            if reply[_TALK_RESULT] != _OK:
-                raise TalkBusyError(f"the camera refused talk on channel {channel}")
-            self._talking = True
-
-    async def send_audio(self, pcm_chunk: bytes) -> None:
-        writer = self._writer
-        if not self._talking or writer is None:
-            raise ConnectError("talk is not active")
-        count = len(pcm_chunk) // SUBFRAME_PCM_BYTES
-        seq = self._audio_seq
-        if seq + count > _DATA_SEQ_WRAP:
-            seq = 0
-        packets = frame_talk_audio(pcm_chunk, _TALK_CODEC, seq, self._peer_ip())
-        self._audio_seq = seq + count
-        try:
-            writer.write(packets)
-            await writer.drain()
-        except (OSError, ConnectionError) as exc:
-            raise ConnectError(f"audio send failed: {exc}") from exc
-
-    async def stop_talk(self) -> None:
-        async with self._talk_lock:
-            if not self._talking:
-                return
-            self._talking = False
-            await self._talk_exchange(_END)
-
     async def close(self) -> None:
         self._closing = True
         task = self._run_task
@@ -143,6 +97,9 @@ class NvsConnection:
         self._fail_pending(ConnectError("connection closed"))
         self._set_available(False)
         await self._close_transport()
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+            self._session = None
 
     async def _run(self) -> None:
         while not self._closing:
@@ -194,15 +151,15 @@ class NvsConnection:
         return False
 
     async def _connect_once(self) -> None:
-        try:
-            reader, writer = await asyncio.open_connection(self._host, self._port)
-        except OSError as exc:
-            raise ConnectError(f"cannot reach {self._host}:{self._port}: {exc}") from exc
-        self._reader = reader
-        self._writer = writer
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        self._transport = await WsTransport.open(
+            self._session, f"ws://{host}:{self._port}", self._login_timeout
+        )
         self._rx_buffer = bytearray()
+        self._commands.clear()
         self._seq = 0
-        self._audio_seq = 0
         self._session_id = 1
         try:
             await self._login_exchange()
@@ -212,41 +169,33 @@ class NvsConnection:
 
     async def _login_exchange(self) -> None:
         try:
-            logon = self._login.build_logon(
-                self._username, self._password, self._next_seq()
-            )
+            first = self._login.first_fields(self._username, self._password)
         except ProtocolError as exc:
             raise AuthError(f"cannot build the logon message: {exc}") from exc
-        assert self._writer is not None and self._reader is not None
-        try:
-            self._writer.write(logon)
-            await self._writer.drain()
-        except (OSError, ConnectionError) as exc:
-            raise ConnectError(f"cannot send the logon message: {exc}") from exc
+        await self._send(first)
         buffer = self._rx_buffer
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._login_timeout
         while True:
-            frame = _take_frame(buffer)
-            if frame is not None:
-                if frame.fields is not None:
-                    result = self._login.interpret_reply(frame.fields)
-                    if result.success:
-                        self.device = result.device
-                        return
+            fields = self._take_command()
+            if fields is not None:
+                result = self._login.interpret_reply(fields)
+                if result.success:
+                    self.device = result.device
+                    return
+                if result.next_fields is not None:
+                    await self._send(result.next_fields)
                 continue
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise AuthError("login did not finish before the timeout")
+                raise ConnectError("login did not finish before the timeout")
+            assert self._transport is not None
             try:
-                chunk = await asyncio.wait_for(self._reader.read(_READ_SIZE), remaining)
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                raise AuthError("login did not finish before the timeout") from exc
-            # after the timeout clause: TimeoutError is an OSError too
-            except (OSError, ConnectionError) as exc:
-                raise ConnectError(f"cannot read the login reply: {exc}") from exc
+                chunk = await asyncio.wait_for(self._transport.read(), remaining)
+            except TimeoutError as exc:
+                raise ConnectError("login did not finish before the timeout") from exc
             if not chunk:
-                raise AuthError("the camera closed the connection during login")
+                raise ConnectError("the camera closed the connection during login")
             buffer += chunk
             if len(buffer) > _MAX_BUFFER:
                 buffer.clear()
@@ -254,17 +203,19 @@ class NvsConnection:
     async def _receive_loop(self) -> None:
         buffer = self._rx_buffer
         while not self._closing:
-            while True:
-                frame = _take_frame(buffer)
-                if frame is None:
-                    break
-                self._route(frame)
-            reader = self._reader
-            if reader is None:
+            while (fields := self._take_command()) is not None:
+                self._route(fields)
+            transport = self._transport
+            if transport is None:
                 return
             try:
-                chunk = await reader.read(_READ_SIZE)
-            except (OSError, ConnectionError):
+                chunk = await asyncio.wait_for(transport.read(), self._idle_timeout)
+            except TimeoutError:
+                _log.debug(
+                    "no data from %s for %.0fs; reconnecting",
+                    self._host,
+                    self._idle_timeout,
+                )
                 return
             if not chunk:
                 return
@@ -276,27 +227,17 @@ class NvsConnection:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            writer = self._writer
-            if writer is None:
-                return
             try:
                 # empty command packet, header only (protocol.md, Heartbeat)
-                writer.write(build_command([], self._next_seq()))
-                await writer.drain()
-            except (OSError, ConnectionError):
+                await self._send([])
+            except ConnectError:
                 return
 
-    async def _talk_exchange(self, action: str) -> list[str]:
-        message = [
-            self._peer_ip(),
-            _TALK_ROUTE,
-            str(_TALK_CHANNEL),
-            "",
-            "CMD",
-            "TALK",
-            action,
-        ]
-        return await self._exchange(self._talk_pending, action, message, None)
+    async def _send(self, fields: list[str]) -> None:
+        transport = self._transport
+        if transport is None:
+            raise ConnectError("not connected")
+        await transport.write(build_command(fields, self._next_seq()))
 
     async def _exchange(
         self,
@@ -305,18 +246,13 @@ class NvsConnection:
         message: list[str],
         timeout: float | None,
     ) -> list[str]:
-        writer = self._writer
-        if not self._available or writer is None:
+        if not self._available or self._transport is None:
             raise ConnectError("not connected")
         limit = self._request_timeout if timeout is None else timeout
         future: asyncio.Future[list[str]] = asyncio.get_running_loop().create_future()
         pending[key] = future
         try:
-            try:
-                writer.write(build_command(message, self._next_seq()))
-                await writer.drain()
-            except (OSError, ConnectionError) as exc:
-                raise ConnectError(f"request send failed: {exc}") from exc
+            await self._send(message)
             try:
                 return await asyncio.wait_for(future, limit)
             except TimeoutError as exc:
@@ -324,17 +260,19 @@ class NvsConnection:
         finally:
             pending.pop(key, None)
 
-    def _route(self, frame: Frame) -> None:
-        fields = frame.fields
-        if fields is None:
-            return
+    def _take_command(self) -> list[str] | None:
+        while not self._commands:
+            frame = _take_frame(self._rx_buffer)
+            if frame is None:
+                return None
+            self._commands.extend(frame.commands or [])
+        return self._commands.popleft()
+
+    def _route(self, fields: list[str]) -> None:
         if fields[2:4] == _ALARM_HEAD:
             event = parse_event(fields)
             if event is not None:
                 self._emit(self._on_event, event, "event")
-            return
-        if fields[2:4] == _TALK_HEAD:
-            self._route_talk(fields)
             return
         session_id = _reply_session_id(fields)
         if session_id is None:
@@ -343,22 +281,11 @@ class NvsConnection:
         if future is not None and not future.done():
             future.set_result(fields)
 
-    def _route_talk(self, fields: list[str]) -> None:
-        # talk replies carry no session id, so BEGIN and END are told apart by name
-        if len(fields) <= _TALK_RESULT:
-            return
-        future = self._talk_pending.pop(fields[_TALK_ACTION], None)
-        if future is not None and not future.done():
-            future.set_result(fields)
-
     def _fail_pending(self, error: Exception) -> None:
-        for future in [*self._pending.values(), *self._talk_pending.values()]:
+        for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)
         self._pending.clear()
-        self._talk_pending.clear()
-        # a new connection needs a new BEGIN
-        self._talking = False
 
     def _set_available(self, state: bool) -> None:
         if state == self._available:
@@ -374,23 +301,9 @@ class NvsConnection:
             _log.exception("%s callback raised", label)
 
     async def _close_transport(self) -> None:
-        writer = self._writer
-        self._writer = None
-        self._reader = None
-        if writer is None:
-            return
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (OSError, ConnectionError):
-            pass
-
-    def _peer_ip(self) -> str:
-        writer = self._writer
-        peer = writer.get_extra_info("peername") if writer is not None else None
-        if not peer:
-            raise ConnectError("not connected")
-        return str(peer[0])
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            await transport.close()
 
     def _next_seq(self) -> int:
         seq = self._seq

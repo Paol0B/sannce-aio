@@ -1,36 +1,27 @@
 import asyncio
+import base64
 import contextlib
 import errno
 import gc
 import hashlib
-import io
 import logging
 import socket
-import struct
-import wave
 import xml.etree.ElementTree as ET
 
 import aiohttp
 import pytest
 import pytest_asyncio
 
-from sannce_aio.audio import (
-    G711A,
-    SUBFRAME_PCM_BYTES,
-    decode_alaw,
-    encode_alaw,
-    frame_talk_audio,
-)
 from sannce_aio.connection import NvsConnection
 from sannce_aio.discovery import (
     DiscoveredCamera,
     build_seek_request,
     parse_discovery_reply,
 )
-from sannce_aio.errors import AuthError
+from sannce_aio.errors import AuthError, ProtocolError
 from sannce_aio.events import Event, parse_event
-from sannce_aio.http import Detection, HttpClient
-from sannce_aio.login import PlaintextLogin
+from sannce_aio.http import Detection, HttpClient, LightState
+from sannce_aio.login import SaltedLogin
 from sannce_aio.protocol import build_command, parse_frame
 from sannce_aio.simulator import CameraSimulator, event_fields
 
@@ -41,7 +32,6 @@ USER = "admin"
 PASSWORD = "admin123"
 MOTION_START = ["INNER", "ALARM", "MOTIONDETECT", "0", "1"]
 MOTION_STOP = ["INNER", "ALARM", "MOTIONDETECT", "0", "0"]
-TALK_REQUEST = [DEVICE_IP, "NVR", "0", "", "CMD", "TALK"]
 BAD_CREDENTIALS = pytest.mark.parametrize(
     ("user", "password"),
     [(USER, "wrong"), ("root", PASSWORD)],
@@ -50,11 +40,11 @@ BAD_CREDENTIALS = pytest.mark.parametrize(
 LIGHT_PATH = "/ISAPI/Image/channels/1/WhiteLight"
 MODE_PATH = "/CGI/System/CommonEnable/channels/1/Type/4120"
 DETECTION_PATH = "/ISAPI/System/Video/inputs/channels/1/motionDetection"
+# header bytes 4-5 hold the sequence number, which differs from the examples
+SEQUENCE_END = 6
 HTTP_GET_BODIES = [
     "http_device_info_reply",
     "http_capabilities_reply",
-    "http_whitelight_get_reply",
-    "http_motion_detection_get_reply",
 ]
 
 
@@ -62,12 +52,14 @@ def camera(*inner):
     return [DEVICE_IP, "IP", *inner]
 
 
-TALK_REPLY = camera("INNER", "NVR", "0", "", "CMD", "TALK")
-
-
 def fields_of(examples, example_id):
     frame, _ = parse_frame(bytes.fromhex(examples[example_id]["hex"]))
-    return frame.fields
+    [fields] = frame.commands
+    return fields
+
+
+def example_bytes(examples, example_id):
+    return bytes.fromhex(examples[example_id]["hex"])
 
 
 def body_of(examples, example_id):
@@ -84,47 +76,75 @@ async def wait_until(predicate, timeout=3.0):
     raise AssertionError("condition was not met in time")
 
 
+def salted(value, salt):
+    return base64.b64encode(hashlib.md5(value.encode() + salt).digest()).decode()
+
+
 class RawClient:
-    def __init__(self, reader, writer):
-        self.reader = reader
-        self.writer = writer
+    def __init__(self, session, ws):
+        self.session = session
+        self.ws = ws
         self.buffer = bytearray()
+        self.commands = []
+        self.packets = []
         self.seq = 0
 
-    def send(self, fields):
-        self.writer.write(build_command(fields, self.seq))
+    async def send(self, fields):
+        await self.ws.send_bytes(build_command(fields, self.seq))
         self.seq += 1
 
-    def send_bytes(self, data):
-        self.writer.write(data)
+    async def send_bytes(self, data):
+        await self.ws.send_bytes(data)
 
     async def recv(self, timeout=2.0):
-        while True:
+        while not self.commands:
             frame, used = parse_frame(bytes(self.buffer))
-            if frame is not None:
-                del self.buffer[:used]
-                return frame.fields
-            chunk = await asyncio.wait_for(self.reader.read(4096), timeout)
-            if not chunk:
-                return None
-            self.buffer += chunk
+            if frame is None:
+                message = await self.ws.receive(timeout)
+                if message.type is not aiohttp.WSMsgType.BINARY:
+                    return None
+                self.buffer += message.data
+                continue
+            self.packets.append(bytes(self.buffer[:used]))
+            del self.buffer[:used]
+            if not frame.commands:
+                return []
+            self.commands.extend(frame.commands)
+        return self.commands.pop(0)
 
     async def login(self):
-        logon = PlaintextLogin(DEVICE_IP).build_logon(USER, PASSWORD, self.seq)
-        self.seq += 1
-        self.send_bytes(logon)
-        return [await self.recv(), await self.recv()]
+        await self.send(SaltedLogin(DEVICE_IP).first_fields(USER, PASSWORD))
+        replies = [await self.recv()]
+        salt = base64.b64decode(replies[0][8])
+        user, password = salted(USER, salt), salted(PASSWORD, salt)
+        await self.send(
+            [DEVICE_IP, "IP", "USER", "LOGON", user, password, "", "3", "UTF-8", "0", "1"]
+        )
+        while replies[-1][2:] != ["INNER", "LOGON", "FINISHED"]:
+            reply = await self.recv()
+            assert reply is not None, "the camera closed the connection during login"
+            replies.append(reply)
+        # the camera sends more messages right after LOGON FINISHED
+        return replies + await self.read_all()
 
     async def barrier(self):
         # the camera handles frames in order, so its answer to a heartbeat
         # proves it has handled everything sent before
-        self.send([])
+        await self.send([])
         assert await self.recv() == []
 
+    async def read_all(self):
+        # the heartbeat answer comes after every frame the camera sent before it
+        await self.send([])
+        frames = []
+        while (fields := await self.recv()) != []:
+            assert fields is not None, "the camera closed the connection"
+            frames.append(fields)
+        return frames
+
     async def close(self):
-        self.writer.close()
-        with contextlib.suppress(OSError):
-            await self.writer.wait_closed()
+        await self.ws.close()
+        await self.session.close()
 
 
 class Http:
@@ -173,7 +193,7 @@ async def make_connection(simulator):
         conn = NvsConnection(
             simulator.host,
             simulator.port,
-            PlaintextLogin(DEVICE_IP),
+            SaltedLogin(DEVICE_IP),
             on_event=(events.append if events is not None else lambda _event: None),
             on_availability=(
                 availability.append if availability is not None else lambda _state: None
@@ -193,8 +213,13 @@ async def open_raw(simulator):
     clients = []
 
     async def open_(*, login=True):
-        reader, writer = await asyncio.open_connection(simulator.host, simulator.port)
-        client = RawClient(reader, writer)
+        session = aiohttp.ClientSession()
+        try:
+            ws = await session.ws_connect(f"ws://{simulator.host}:{simulator.port}")
+        except BaseException:
+            await session.close()
+            raise
+        client = RawClient(session, ws)
         clients.append(client)
         if login:
             await client.login()
@@ -250,7 +275,7 @@ async def test_connection_is_refused_for_bad_credentials(
 ):
     conn = make_connection(login_timeout=0.5)
 
-    with pytest.raises(AuthError):
+    with pytest.raises(AuthError, match="reason 2"):
         await conn.connect(user, password)
 
 
@@ -289,23 +314,46 @@ async def test_connection_heartbeats_are_counted_and_keep_it_available(
     assert availability == [True]
 
 
-async def test_login_replies_with_command_id_then_finished(examples, open_raw):
+async def test_login_asks_for_md5_then_finishes(examples, open_raw):
     client = await open_raw(login=False)
 
-    command_id, finished = await client.login()
+    refusal, command_id, channel_data, finished, *_ = await client.login()
 
+    assert refusal[2:8] == ["INNER", "USER", "LOGONFAILED", "3", "1", "1"]
+    assert len(base64.b64decode(refusal[8], validate=True)) == 8
+    assert refusal[9:] == ["0", "0"]
     assert command_id[2:4] == ["INNER", "CMDID"] and len(command_id) == 5
+    assert channel_data[2:] == ["INNER", "LOGON", "CHANNELDATA", "FINISHED"]
     assert finished == fields_of(examples, "logon_reply_success")
+
+
+async def test_after_login_the_camera_sends_activation_and_two_commands_in_one_frame(
+    open_raw,
+):
+    client = await open_raw(login=False)
+
+    *_, activation, phone, users = await client.login()
+
+    assert activation == camera("INNER", "USER", "ACTIVATION", "1")
+    assert phone == camera("INNER", "USER", "RESERVEPHONE", "2", "0", "owner@example.com", "")
+    assert users == camera("INNER", "SUPER", "GETUSERNUM", "2")
+    payloads = [packet[20:] for packet in client.packets]
+    assert b"192.168.1.10\tIP\tINNER\tUSER\tACTIVATION\t1\n\n\n\n\n\n" in payloads
+    assert (
+        b"192.168.1.10\tIP\tINNER\tUSER\tRESERVEPHONE\t2\t0\towner@example.com\t\n\n\n"
+        b"INNER\tSUPER\tGETUSERNUM\t2\n\n\n"
+    ) in payloads
 
 
 async def test_nothing_is_answered_or_pushed_before_login(simulator, open_raw):
     client = await open_raw(login=False)
     await wait_until(lambda: simulator.clients == 1)
-    client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "5"])
+    await client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "5"])
     await simulator.push_event(MOTION_START)
 
-    command_id, _ = await client.login()
+    refusal, command_id, *_ = await client.login()
 
+    assert refusal[2:6] == ["INNER", "USER", "LOGONFAILED", "3"]
     assert command_id[2:4] == ["INNER", "CMDID"]
     assert simulator.requests == []
 
@@ -317,25 +365,26 @@ async def test_frame_with_a_bad_payload_is_skipped(open_raw):
     bad[18:20] = (len(bad) - 20).to_bytes(2, "little")
     client = await open_raw()
 
-    client.send_bytes(bytes(bad))
+    await client.send_bytes(bytes(bad))
 
     await client.barrier()
 
 
 async def test_heartbeat_is_answered_with_an_empty_packet(simulator, open_raw):
     client = await open_raw()
+    before = simulator.heartbeats
 
-    client.send([])
+    await client.send([])
 
     assert await client.recv() == []
-    assert simulator.heartbeats == 1
+    assert simulator.heartbeats == before + 1
 
 
 async def test_paraget_sends_the_values_then_finished(simulator, open_raw):
     simulator.params["DEVICETYPE"] = ["I91FW", "2"]
     client = await open_raw()
 
-    client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "5"])
+    await client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "5"])
 
     head = camera("INNER", "PARAGET", "DEVICETYPE")
     assert await client.recv() == [*head, "I91FW", "2"]
@@ -345,10 +394,10 @@ async def test_paraget_sends_the_values_then_finished(simulator, open_raw):
 async def test_paraset_stores_the_values_paraget_returns(simulator, open_raw):
     client = await open_raw()
 
-    client.send([DEVICE_IP, "PROXY", "PARASET", "DEVICETYPE", "X1", "X2", "3"])
+    await client.send([DEVICE_IP, "PROXY", "PARASET", "DEVICETYPE", "X1", "X2", "3"])
     head = camera("INNER", "PARASET", "DEVICETYPE")
     assert await client.recv() == [*head, "FINISHED", "3", "0"]
-    client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "4"])
+    await client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE", "4"])
 
     assert (await client.recv())[4:] == ["DEVICETYPE", "X1", "X2"]
     assert simulator.params == {"DEVICETYPE": ["X1", "X2"]}
@@ -357,7 +406,7 @@ async def test_paraset_stores_the_values_paraget_returns(simulator, open_raw):
 async def test_paraget_of_an_unknown_name_fails(open_raw):
     client = await open_raw()
 
-    client.send([DEVICE_IP, "PROXY", "PARAGET", "NOSUCH", "6"])
+    await client.send([DEVICE_IP, "PROXY", "PARAGET", "NOSUCH", "6"])
 
     assert await client.recv() == camera(
         "INNER", "PARAGET", "NOSUCH", "FINISHED", "6", "1"
@@ -370,7 +419,7 @@ async def test_command_without_a_session_id_is_recorded_but_not_answered(
     client = await open_raw()
     command = [DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE"]
 
-    client.send(command)
+    await client.send(command)
     await client.barrier()
 
     assert simulator.requests == [command]
@@ -379,7 +428,7 @@ async def test_command_without_a_session_id_is_recorded_but_not_answered(
 async def test_unknown_command_fails_instead_of_hanging(simulator, open_raw):
     client = await open_raw()
 
-    client.send([DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0", "7"])
+    await client.send([DEVICE_IP, "PROXY", "CMD", "GETPARAM", "20", "0", "7"])
 
     assert await client.recv() == camera(
         "INNER", "CMD", "GETPARAM", "FINISHED", "7", "1"
@@ -392,15 +441,35 @@ async def test_pushed_event_matches_the_documented_message(
 ):
     client = await open_raw()
 
-    await simulator.push_event(MOTION_START)
+    await simulator.push_event([*MOTION_START, "0012310019100435"])
 
     assert await client.recv() == fields_of(examples, "event_motion_start")
+    documented = example_bytes(examples, "event_motion_start")
+    assert client.packets[-1][SEQUENCE_END:] == documented[SEQUENCE_END:]
+
+
+@pytest.mark.parametrize(
+    ("action", "example_id"),
+    [("start_alarm", "event_motion_start"), ("stop_alarm", "event_motion_stop")],
+)
+async def test_alarms_match_the_documented_bytes(
+    simulator, open_raw, examples, action, example_id
+):
+    client = await open_raw()
+
+    await getattr(simulator, action)("motion")
+
+    assert await client.recv() == fields_of(examples, example_id)
+    documented = example_bytes(examples, example_id)
+    assert client.packets[-1][SEQUENCE_END:] == documented[SEQUENCE_END:]
 
 
 async def test_push_event_skips_a_session_that_is_closing(simulator, open_raw):
     client = await open_raw()
     (session,) = simulator._sessions
-    session.writer.close()
+    await session.ws.close()
+    # the closed handler has already dropped it; list it again as if it had not
+    simulator._sessions.add(session)
 
     await simulator.push_event(MOTION_START)
 
@@ -414,245 +483,6 @@ async def test_events_reach_every_logged_in_client(simulator, open_raw):
     await simulator.push_event(MOTION_START)
 
     assert await first.recv() == await second.recv()
-
-
-async def test_talk_begin_is_accepted(simulator, open_raw):
-    client = await open_raw()
-
-    client.send([*TALK_REQUEST, "BEGIN"])
-
-    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
-    assert simulator.talking
-
-
-async def test_talk_begin_with_the_optional_audio_fields_is_accepted(
-    simulator, open_raw
-):
-    client = await open_raw()
-
-    client.send([*TALK_REQUEST, "BEGIN", "1", "8000"])
-
-    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
-    assert simulator.talking
-
-
-async def test_talk_busy_is_refused_with_the_documented_reply(
-    simulator, open_raw, examples
-):
-    simulator.set_talk_busy(True)
-    client = await open_raw()
-
-    client.send([*TALK_REQUEST, "BEGIN"])
-
-    assert await client.recv() == fields_of(examples, "talk_refused_busy")
-    assert not simulator.talking
-
-
-async def test_talk_is_accepted_again_when_no_longer_busy(simulator, open_raw):
-    simulator.set_talk_busy(True)
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    simulator.set_talk_busy(False)
-    client.send([*TALK_REQUEST, "BEGIN"])
-
-    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
-
-
-async def test_talk_on_a_missing_channel_is_refused(simulator, open_raw):
-    client = await open_raw()
-
-    client.send([DEVICE_IP, "NVR", "1", "", "CMD", "TALK", "BEGIN"])
-
-    assert await client.recv() == camera(
-        "INNER", "NVR", "1", "", "CMD", "TALK", "BEGIN", "ERROR"
-    )
-    assert not simulator.talking
-
-
-@pytest.mark.parametrize(
-    "request_fields",
-    [
-        [DEVICE_IP, "PROXY", "0", "", "CMD", "TALK", "BEGIN"],
-        [DEVICE_IP, "PROXY", "CMD", "TALK", "BEGIN"],
-    ],
-    ids=["channel_on_proxy", "single_talk"],
-)
-async def test_talk_on_another_route_is_not_answered(
-    simulator, open_raw, request_fields
-):
-    client = await open_raw()
-
-    client.send(request_fields)
-    await client.barrier()
-
-    assert not simulator.talking
-
-
-@pytest.mark.parametrize("action", ["BEGIN", "END"])
-async def test_talk_with_a_filled_reserved_field_is_not_answered(
-    simulator, open_raw, action
-):
-    client = await open_raw()
-
-    client.send([DEVICE_IP, "NVR", "0", "x", "CMD", "TALK", action])
-    await client.barrier()
-
-    assert not simulator.talking
-
-
-async def test_talk_audio_is_decoded_while_talking(simulator, open_raw, examples):
-    packet = bytes.fromhex(examples["talk_audio_frame_g711a"]["hex"])
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send_bytes(packet + packet)
-
-    await wait_until(lambda: len(simulator.talk_frames) == 2)
-    assert simulator.talk_frames == [packet[-80:], packet[-80:]]
-
-
-async def test_talk_audio_from_the_library_framer_is_decoded(simulator, open_raw):
-    pcm = struct.pack("<320h", *range(-16000, 16000, 100))
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send_bytes(frame_talk_audio(pcm, G711A, 0, "10.1.2.3"))
-
-    await wait_until(lambda: len(simulator.talk_frames) == 4)
-    assert simulator.talk_frames == [
-        encode_alaw(pcm[start : start + SUBFRAME_PCM_BYTES])
-        for start in range(0, len(pcm), SUBFRAME_PCM_BYTES)
-    ]
-
-
-async def test_talk_audio_sequence_numbers_are_recorded(simulator, open_raw):
-    pcm = bytes(2 * SUBFRAME_PCM_BYTES)
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send_bytes(frame_talk_audio(pcm, G711A, 5, "10.1.2.3"))
-    client.send_bytes(frame_talk_audio(pcm, G711A, 40, "10.1.2.3"))
-    await client.barrier()
-
-    assert simulator.talk_seqs == [5, 6, 40, 41]
-
-
-async def test_talk_audio_outside_a_talk_is_dropped(simulator, open_raw, examples):
-    packet = bytes.fromhex(examples["talk_audio_frame_g711a"]["hex"])
-    client = await open_raw()
-
-    client.send_bytes(packet)
-    await client.barrier()
-
-    assert simulator.talk_frames == []
-
-
-async def test_talk_end_is_acknowledged_and_stops_the_audio(
-    simulator, open_raw, examples
-):
-    packet = bytes.fromhex(examples["talk_audio_frame_g711a"]["hex"])
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send([*TALK_REQUEST, "END"])
-    assert await client.recv() == [*TALK_REPLY, "END", "OK"]
-    client.send_bytes(packet)
-    await client.barrier()
-
-    assert not simulator.talking
-    assert simulator.talk_frames == []
-
-
-async def test_talk_ends_when_the_client_disconnects(simulator, open_raw):
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-    assert simulator.talking
-
-    await client.close()
-
-    await wait_until(lambda: not simulator.talking)
-
-
-def truncate(packet):
-    del packet[-1]
-    packet[14:16] = len(packet).to_bytes(2, "little")
-
-
-def extend(packet):
-    packet.append(0)
-    packet[14:16] = len(packet).to_bytes(2, "little")
-
-
-def rename_marker(packet):
-    packet[20:23] = b"XYZ"
-
-
-def break_subheader_start(packet):
-    packet[packet.index(b"NVS\x00") + 8] = 0xFF
-
-
-def break_subheader_end(packet):
-    packet[packet.index(b"NVS\x00") + 11] = 0x01
-
-
-def other_channel(packet):
-    packet[packet.index(b"NVS\x00") - 4] = 0x01
-
-
-def ascii_channel(packet):
-    packet[packet.index(b"NVS\x00") - 4] = ord("0")
-
-
-def leading_byte(packet):
-    packet[20:20] = b"\x01"
-    packet[14:16] = len(packet).to_bytes(2, "little")
-
-
-def two_channels(packet):
-    at = packet.index(b"NVS\x00") - 3
-    packet[at:at] = b",\x01"
-    packet[14:16] = len(packet).to_bytes(2, "little")
-
-
-def no_channel(packet):
-    del packet[packet.index(b"NVS\x00") - 4]
-    packet[14:16] = len(packet).to_bytes(2, "little")
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        truncate,
-        extend,
-        rename_marker,
-        break_subheader_start,
-        break_subheader_end,
-        other_channel,
-        ascii_channel,
-        two_channels,
-        no_channel,
-        leading_byte,
-    ],
-    ids=lambda damage: damage.__name__,
-)
-async def test_malformed_talk_audio_is_dropped(simulator, open_raw, examples, damage):
-    packet = bytearray(bytes.fromhex(examples["talk_audio_frame_g711a"]["hex"]))
-    damage(packet)
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send_bytes(bytes(packet))
-    await client.barrier()
-
-    assert simulator.talk_frames == []
 
 
 async def test_stop_releases_both_ports(simulator):
@@ -673,7 +503,7 @@ async def test_stop_closes_open_connections(simulator, open_raw):
 
 async def test_stop_after_a_client_left_does_not_hang(simulator, open_raw):
     client = await open_raw()
-    (session,) = simulator._sessions  # keeps the server-side writer alive
+    (session,) = simulator._sessions  # keeps the server-side session alive
     await client.close()
     await wait_until(lambda: simulator.clients == 0)
 
@@ -693,10 +523,7 @@ async def test_http_serves_the_example_body(examples, http, example_id):
 
 @pytest.mark.parametrize(
     ("example_id", "attribute", "field"),
-    [
-        ("http_whitelight_set_manual_on", "light_control", "contrltype"),
-        ("http_light_mode_set_smart", "light_mode", "value"),
-    ],
+    [("http_light_mode_set_smart", "light_mode", "value")],
 )
 async def test_http_put_example_updates_the_state(
     examples, simulator, http, example_id, attribute, field
@@ -775,13 +602,70 @@ async def test_client_reads_the_example_capabilities(examples, client):
 
 
 async def test_client_light_writes_reach_the_simulator(simulator, client):
-    await client.set_light(True)
-    assert simulator.light_control == 1
-    assert (await client.get_light()).on
+    await client.set_light_mode("color")
+    await client.force_light_on(40)
+    assert simulator.light_control == 3
+    assert (simulator.light_on_time, simulator.light_off_time) == ("00:00:00", "23:59:00")
+    assert simulator.light_power == 40
+    assert simulator.lamp_on
+    assert (await client.get_light()).forced_on
 
-    await client.set_light(False)
+    await client.release_light()
     assert simulator.light_control == 0
-    assert not (await client.get_light()).on
+    assert not simulator.lamp_on
+    assert not (await client.get_light()).forced_on
+
+
+async def test_manual_on_is_refused_like_the_camera(client):
+    with pytest.raises(ProtocolError, match="Device Error"):
+        await client._write(
+            "/ISAPI/Image/channels/1/WhiteLight",
+            "<WhiteLight><contrltype>1</contrltype></WhiteLight>",
+        )
+
+
+@pytest.mark.parametrize(("mode", "control"), [("infrared", 2), ("smart", 2), ("color", 0)])
+async def test_a_mode_change_resets_the_lamp_control(simulator, client, mode, control):
+    simulator.light_control = 3
+    await client.set_light_mode(mode)
+    assert simulator.light_control == control
+
+
+async def test_the_lamp_is_on_only_in_color_or_custom(simulator, client):
+    await client.force_light_on(50)
+    assert simulator.lamp_on is (simulator.light_mode in (3, 4))
+
+
+async def test_client_reads_the_light_and_detection_as_the_camera_sends_them(client):
+    assert await client.get_light() == LightState(
+        control=2,
+        options=(0, 2, 3),
+        power=100,
+        far_power=100,
+        on_time="17:00:00",
+        off_time="07:00:00",
+    )
+    assert await client.get_detection() == Detection(
+        person=True, vehicle=True, motion=False, sensitivity=76
+    )
+
+
+async def test_play_audio_beyond_the_samples_is_refused(client):
+    with pytest.raises(ProtocolError, match="Device Error"):
+        await client.play_sound(3)
+
+
+async def test_the_siren_link_comes_and_goes_beside_the_lamp_link(simulator, client):
+    await client.set_siren_on_event(True)
+    assert [link["notificationMethod"] for link in simulator.vmd_links] == [
+        "whiteLampForBody",
+        "guardsound",
+    ]
+    assert simulator.siren_on_event
+
+    await client.set_siren_on_event(False)
+    assert [link["notificationMethod"] for link in simulator.vmd_links] == ["whiteLampForBody"]
+    assert not simulator.siren_on_event
 
 
 async def test_client_light_mode_writes_reach_the_simulator(simulator, client):
@@ -796,7 +680,7 @@ async def test_client_detection_writes_reach_the_simulator(simulator, client):
 
     assert simulator.detection == {"person": False, "vehicle": True, "motion": True}
     assert await client.get_detection() == Detection(
-        person=False, vehicle=True, motion=True
+        person=False, vehicle=True, motion=True, sensitivity=76
     )
 
 
@@ -815,24 +699,6 @@ async def connects(host, port):
     with contextlib.suppress(OSError):
         await writer.wait_closed()
     return True
-
-
-def wav_frames(data):
-    with wave.open(io.BytesIO(data)) as wav:
-        assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) == (
-            1,
-            2,
-            8000,
-        )
-        return wav.readframes(wav.getnframes())
-
-
-async def talk(client, pcm):
-    client.send([*TALK_REQUEST, "BEGIN"])
-    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
-    client.send_bytes(frame_talk_audio(pcm, G711A, 0, "10.1.2.3"))
-    client.send([*TALK_REQUEST, "END"])
-    assert await client.recv() == [*TALK_REPLY, "END", "OK"]
 
 
 class SeekReceiver(asyncio.DatagramProtocol):
@@ -1092,28 +958,34 @@ async def test_two_concurrent_drops_reopen_the_port_once(
 
 async def test_reset_restores_the_start_state(simulator, open_raw):
     client = await open_raw()
-    await talk(client, bytes(SUBFRAME_PCM_BYTES))
+    await client.send([DEVICE_IP, "PROXY", "PARAGET", "DEVICETYPE"])
     await client.barrier()
     simulator.params["DEVICETYPE"] = ["I91FW"]
-    assert simulator.requests and simulator.heartbeats and simulator.talk_seqs
-    simulator.light_control = 1
+    assert simulator.requests and simulator.heartbeats
+    simulator.light_control = 3
     simulator.light_mode = 3
+    simulator.light_on_time = "00:00:00"
+    simulator.light_power = 20
+    simulator.sounds.append((1, 1))
+    simulator.volume = 10
+    simulator.vmd_links.append({"id": "guardsound-1", "notificationMethod": "guardsound"})
     simulator.detection["motion"] = True
+    simulator.sensitivity = 5
     simulator.password = "changed"
-    simulator.set_talk_busy(True)
 
     await simulator.reset()
 
-    assert (simulator.light_control, simulator.light_mode) == (0, 1)
+    assert (simulator.light_control, simulator.light_mode) == (2, 2)
+    assert (simulator.light_on_time, simulator.light_power) == ("17:00:00", 100)
+    assert (simulator.sounds, simulator.volume) == ([], 80)
+    assert simulator.siren_on_event is False
     assert simulator.detection == {"person": True, "vehicle": True, "motion": False}
+    assert simulator.sensitivity == 76
     assert simulator.password == PASSWORD
-    assert simulator.talk_frames == []
     assert (simulator.requests, simulator.heartbeats) == ([], 0)
-    assert (simulator.params, simulator.talk_seqs) == ({}, [])
-    assert wav_frames(simulator.talk_wav()) == b""
+    assert simulator.params == {}
     assert simulator.clients == 1
-    client.send([*TALK_REQUEST, "BEGIN"])
-    assert await client.recv() == [*TALK_REPLY, "BEGIN", "OK"]
+    await client.barrier()
 
 
 async def test_a_new_password_holds_for_new_logins_only(
@@ -1129,43 +1001,20 @@ async def test_a_new_password_holds_for_new_logins_only(
     await make_connection().connect(USER, "changed")
 
 
-async def test_talk_wav_is_empty_before_any_talk(simulator):
-    assert wav_frames(simulator.talk_wav()) == b""
-
-
-async def test_talk_wav_holds_only_the_last_session(simulator, open_raw):
-    first = struct.pack("<160h", *range(-8000, 8000, 100))
-    last = struct.pack("<80h", *([1000] * 80))
-    client = await open_raw()
-
-    await talk(client, first)
-    await talk(client, last)
-
-    assert wav_frames(simulator.talk_wav()) == decode_alaw(encode_alaw(last))
-
-
-async def test_talk_wav_grows_while_the_session_runs(simulator, open_raw):
-    client = await open_raw()
-    client.send([*TALK_REQUEST, "BEGIN"])
-    await client.recv()
-
-    client.send_bytes(frame_talk_audio(bytes(SUBFRAME_PCM_BYTES), G711A, 0, "10.1.2.3"))
-    await client.barrier()
-
-    assert len(wav_frames(simulator.talk_wav())) == SUBFRAME_PCM_BYTES
-
-
 @pytest.mark.parametrize(
-    ("kind", "example_id"),
+    ("kind", "example_id", "route", "event_id"),
     [
-        ("motion", "event_motion_start"),
-        ("vehicle", "event_smart_vehicle"),
-        ("intrusion", "event_vca_intrusion"),
-        ("tamper", "event_video_cover"),
+        ("motion", "event_motion_start", "PROXY", "0012310019100435"),
+        ("vehicle", "event_smart_vehicle", "IP", ""),
+        ("intrusion", "event_vca_intrusion", "IP", ""),
+        ("tamper", "event_video_cover", "IP", ""),
     ],
 )
-async def test_event_fields_match_the_documented_start(examples, kind, example_id):
-    assert camera(*event_fields(kind, True)) == fields_of(examples, example_id)
+async def test_event_fields_match_the_documented_start(
+    examples, kind, example_id, route, event_id
+):
+    fields = [DEVICE_IP, route, *event_fields(kind, True, event_id)]
+    assert fields == fields_of(examples, example_id)
 
 
 @pytest.mark.parametrize(
@@ -1179,3 +1028,29 @@ async def test_event_fields_parse_back_to_the_kind(kind, active):
 async def test_event_fields_reject_an_unknown_kind():
     with pytest.raises(ValueError, match="person"):
         event_fields("person", True)
+
+
+async def test_an_active_alarm_repeats_until_stopped(simulator, open_raw):
+    simulator.alarm_interval = 0.05
+    client = await open_raw()
+    await simulator.start_alarm("motion")
+    await asyncio.sleep(0.2)
+    await simulator.stop_alarm("motion")
+
+    # fields: ip, route, INNER, ALARM, MOTIONDETECT, channel, state, id
+    alarms = [f for f in await client.read_all() if f[3:5] == ["ALARM", "MOTIONDETECT"]]
+    assert len(alarms) >= 4
+    assert all(f[1] == "PROXY" and f[7] == "0012310019100435" for f in alarms)
+    assert [f[6] for f in alarms[:-1]] == ["1"] * (len(alarms) - 1)
+    assert alarms[-1][6] == "0"
+
+
+async def test_an_idle_session_gets_keepalive_messages(open_raw, simulator):
+    simulator.keepalive_interval = 0.05
+    client = await open_raw()
+    await asyncio.sleep(0.2)
+
+    frames = await client.read_all()
+    assert any(f[1:6] == ["PROXY", "INNER", "CMD", "EXCEPTION", "0"] for f in frames)
+    keepalives = [packet for packet in client.packets if b"\tEXCEPTION\t" in packet]
+    assert all(packet.endswith(b"\tEXCEPTION\t0\t0\n\n\n\n\n\n") for packet in keepalives)

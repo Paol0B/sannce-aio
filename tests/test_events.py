@@ -11,11 +11,12 @@ VCA_TAIL = ["0", "0", "0:0:0:0", "0", "0", "0,0,0,0,0,0,0", "0", "0", "0", "", "
 
 def fields_of(examples, example_id):
     frame, _ = parse_frame(bytes.fromhex(examples[example_id]["hex"]))
-    return frame.fields
+    [fields] = frame.commands
+    return fields
 
 
-def alarm(name, *args):
-    return [DEVICE_IP, "IP", "INNER", "ALARM", name, *args]
+def alarm(name, *args, route="IP"):
+    return [DEVICE_IP, route, "INNER", "ALARM", name, *args]
 
 
 def vca(rule, channel="0", state="1"):
@@ -47,7 +48,9 @@ def test_person_example_reads_as_motion(examples):
 
 
 def test_builders_match_examples(examples):
-    assert alarm("MOTIONDETECT", "0", "1") == fields_of(examples, "event_motion_start")
+    assert alarm(
+        "MOTIONDETECT", "0", "1", "0012310019100435", route="PROXY"
+    ) == fields_of(examples, "event_motion_start")
     assert alarm("VIDEOCOVER", "0", "1") == fields_of(examples, "event_video_cover")
     assert vca("2") == fields_of(examples, "event_vca_intrusion")
 

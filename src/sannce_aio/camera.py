@@ -8,24 +8,21 @@ from urllib.parse import quote
 
 import aiohttp
 
-from .audio import SUBFRAME_PCM_BYTES
+from .backchannel import Backchannel
 from .connection import NvsConnection
-from .errors import AuthError, SannceError
+from .errors import AuthError, ConnectError, SannceError
 from .events import Event
 from .http import Detection, HttpClient
-from .login import PlaintextLogin
+from .login import SaltedLogin
 
 _log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_TALK_CHANNEL = 0
-# 160 PCM bytes = 80 samples = 10 ms at 8 kHz
-_FRAME_SECONDS = 0.01
-# cap a burst so one large chunk cannot flood the camera
-_MAX_PACE_FRAMES = 32
 _BAD_HOST_CHARS = "/?#@"
 _RTSP_PATHS = {"main": "/1/1", "sub": "/1/2"}
+_LAMP_MODES = frozenset({"color", "custom"})
+_FULL_POWER = 100
 
 
 @dataclass(frozen=True)
@@ -36,6 +33,12 @@ class CameraInfo:
     mac: str | None = None
 
 
+@dataclass(frozen=True)
+class Floodlight:
+    on: bool
+    brightness: int | None
+
+
 class SannceCamera:
     def __init__(
         self,
@@ -43,7 +46,7 @@ class SannceCamera:
         username: str,
         password: str,
         *,
-        nvs_port: int = 3000,
+        nvs_port: int = 3002,
         http_port: int = 80,
         rtsp_port: int = 554,
         session: aiohttp.ClientSession | None = None,
@@ -59,7 +62,8 @@ class SannceCamera:
         self._conn = NvsConnection(
             host,
             nvs_port,
-            PlaintextLogin(host),
+            SaltedLogin(host),
+            session=session,
             on_event=self._handle_event,
             on_availability=self._handle_availability,
             on_login_failed=self._handle_login_failed,
@@ -71,6 +75,7 @@ class SannceCamera:
         self._info = CameraInfo()
         self._caps: frozenset[str] = frozenset()
         self._play_lock = asyncio.Lock()
+        self._sound_count = 0
 
     @property
     def info(self) -> CameraInfo:
@@ -80,12 +85,16 @@ class SannceCamera:
     def caps(self) -> frozenset[str]:
         return self._caps
 
+    @property
+    def sound_count(self) -> int:
+        return self._sound_count
+
     async def connect(self) -> None:
         try:
             features = await self._http.get_capabilities()
             await self._conn.connect(self._username, self._password)
-            light_caps = await self._probe_light_caps()
-            self._caps = _build_caps(features, light_caps)
+            probed = await self._probe_caps()
+            self._caps = _build_caps(features, probed)
             self._info = await self._read_info()
         except BaseException:
             # the HTTP client only closes a session the facade owns
@@ -119,11 +128,43 @@ class SannceCamera:
     def on_login_failed(self, callback: Callable[[AuthError], None]) -> None:
         self._login_failed_subs.append(callback)
 
-    async def get_light(self) -> bool:
-        return (await self._http.get_light()).on
+    async def get_floodlight(self) -> Floodlight:
+        mode = await self._http.get_light_mode()
+        light = await self._http.get_light()
+        return Floodlight(on=mode in _LAMP_MODES and light.forced_on, brightness=light.power)
 
-    async def set_light(self, on: bool) -> None:
-        await self._http.set_light(on)
+    async def set_floodlight(
+        self, on: bool, *, brightness: int | None = None, base_mode: str = "smart"
+    ) -> None:
+        if not on:
+            await self._http.set_light_mode(base_mode)
+            if base_mode == "color":
+                await self._http.release_light()
+            return
+        # the camera refuses a manual on; a full-day timed window in color mode lights
+        # the lamp instead (protocol.md, White light)
+        previous = await self._http.get_light_mode()
+        if previous in _LAMP_MODES:
+            await self._force_on(brightness)
+            return
+        await self._http.set_light_mode("color")
+        try:
+            await self._force_on(brightness)
+        except Exception:
+            # color mode lights the lamp at night by itself
+            await self._restore_light_mode(previous)
+            raise
+
+    async def _force_on(self, brightness: int | None) -> None:
+        if brightness is None:
+            brightness = (await self._http.get_light()).power or _FULL_POWER
+        await self._http.force_light_on(brightness)
+
+    async def _restore_light_mode(self, mode: str) -> None:
+        try:
+            await self._http.set_light_mode(mode)
+        except SannceError as exc:
+            _log.warning("cannot restore light mode %s on %s: %s", mode, self._host, exc)
 
     async def get_light_mode(self) -> str:
         return await self._http.get_light_mode()
@@ -143,42 +184,65 @@ class SannceCamera:
     ) -> None:
         await self._http.set_detection(person=person, vehicle=vehicle, motion=motion)
 
+    async def set_sensitivity(self, level: int) -> None:
+        await self._http.set_sensitivity(level)
+
+    async def play_sound(self, sample: int) -> None:
+        await self._http.play_sound(sample)
+
+    async def stop_sound(self, sample: int) -> None:
+        await self._http.stop_sound(sample)
+
+    async def get_volume(self) -> int:
+        return await self._http.get_volume()
+
+    async def set_volume(self, volume: int) -> None:
+        await self._http.set_volume(volume)
+
+    async def get_siren_on_event(self) -> bool:
+        return await self._http.get_siren_on_event()
+
+    async def set_siren_on_event(self, on: bool) -> None:
+        await self._http.set_siren_on_event(on)
+
     async def play_audio(self, pcm: AsyncIterable[bytes]) -> None:
         async with self._play_lock:
-            await self._conn.start_talk(_TALK_CHANNEL)
+            channel = self._backchannel()
+            await channel.open()
             try:
-                buffer = bytearray()
-                async for chunk in pcm:
-                    buffer += chunk
-                    await self._stream_frames(buffer)
-                tail = len(buffer) % SUBFRAME_PCM_BYTES
-                if tail:
-                    buffer += bytes(SUBFRAME_PCM_BYTES - tail)
-                    await self._stream_frames(buffer)
+                await channel.stream(pcm)
             finally:
-                await self._stop_talk()
+                await channel.close()
 
-    async def _stream_frames(self, buffer: bytearray) -> None:
-        while len(buffer) >= SUBFRAME_PCM_BYTES:
-            frames = min(len(buffer) // SUBFRAME_PCM_BYTES, _MAX_PACE_FRAMES)
-            size = frames * SUBFRAME_PCM_BYTES
-            await self._conn.send_audio(bytes(buffer[:size]))
-            del buffer[:size]
-            await asyncio.sleep(frames * _FRAME_SECONDS)
+    def _backchannel(self) -> Backchannel:
+        return Backchannel(
+            self._host, self._rtsp_port, _RTSP_PATHS["main"], self._username, self._password
+        )
 
-    async def _stop_talk(self) -> None:
-        try:
-            await self._conn.stop_talk()
-        except SannceError:
-            _log.exception("stopping talk failed")
-
-    async def _probe_light_caps(self) -> set[str]:
-        caps = set()
-        if await _probe(self._http.get_light):
-            caps.add("white_light")
-        if await _probe(self._http.get_light_mode):
-            caps.add("light_mode")
+    async def _probe_caps(self) -> set[str]:
+        reads: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
+            ("white_light", self._http.get_light),
+            ("light_mode", self._http.get_light_mode),
+            ("volume", self._http.get_volume),
+            ("siren_on_event", self._http.get_siren_on_event),
+        )
+        caps = {cap for cap, read in reads if await self._probe(cap, read) is not None}
+        self._sound_count = await self._probe("siren", self._http.get_sound_count) or 0
+        if self._sound_count:
+            caps.add("siren")
+        if await self._probe("speaker", self._backchannel().has_backchannel):
+            caps.add("speaker")
         return caps
+
+    async def _probe(self, cap: str, read: Callable[[], Awaitable[_T]]) -> _T | None:
+        # an unreachable camera fails the connect: a cap left out stays out until the next one
+        try:
+            return await read()
+        except ConnectError:
+            raise
+        except SannceError as exc:
+            _log.debug("%s has no %s: %s", self._host, cap, exc)
+            return None
 
     async def _read_info(self) -> CameraInfo:
         try:
@@ -230,19 +294,10 @@ def _check_host(host: str) -> None:
         raise ValueError(f"host must not be empty or contain any of {_BAD_HOST_CHARS!r}")
 
 
-def _build_caps(features: dict[str, bool], light_caps: set[str]) -> frozenset[str]:
-    caps = set(light_caps)
+def _build_caps(features: dict[str, bool], probed: set[str]) -> frozenset[str]:
+    caps = set(probed)
     caps.update(name for name in ("person", "vehicle", "motion") if features.get(name))
-    caps.add("talk")
     return frozenset(caps)
-
-
-async def _probe(call: Callable[[], Awaitable[object]]) -> bool:
-    try:
-        await call()
-    except SannceError:
-        return False
-    return True
 
 
 def _safe_call(callback: Callable[[_T], None], arg: _T, label: str) -> None:

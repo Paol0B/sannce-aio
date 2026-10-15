@@ -20,14 +20,26 @@ _LIGHT = "/ISAPI/Image/channels/{}/WhiteLight"
 _MODE = "/CGI/System/CommonEnable/channels/{}/Type/4120"
 _DETECTION = "/ISAPI/System/Video/inputs/channels/{}/motionDetection"
 _CAPABILITIES = "/CGI/System/channels/{}/capabilities"
+_PLAY_AUDIO = "/CGI/Event/PlayAudio"
+_VMD_TRIGGER = "/ISAPI/Event/triggers/VMD/channels/{}"
+_TWO_WAY_AUDIO = "/ISAPI/System/TwoWayAudio/channels/{}"
+_SENSITIVITY = "MotionDetectionLayout/sensitivityLevel"
+_GUARD_SOUND = "guardsound"
 
 _PERSON_VEHICLE_MOTION_QUERY = (
     "<CapDiscription><capType><mainType>015-AlarmParam</mainType>"
     "<subType>00125-MDMotionDetectionSubList</subType></capType></CapDiscription>"
 )
+_SOUND_QUERY = "<CapDiscription><capType>guardSound</capType></CapDiscription>"
 
 AUTO = 0
-MANUAL_ON = 1
+TIMED = 3
+# the lamp is lit from sunSetTime to sunRiseTime, minute resolution (protocol.md, White light)
+ALWAYS_ON_FROM = "00:00:00"
+ALWAYS_ON_UNTIL = "23:59:00"
+_PLAY = 1
+# not confirmed on the camera yet: the acceptance run checks it (protocol.md, Warning sound)
+_STOP = 0
 MODE_VALUES = {"infrared": 1, "smart": 2, "color": 3}
 # 4 is the user-defined fill: readable, not settable (protocol.md, Light mode)
 MODE_NAMES = {1: "infrared", 2: "smart", 3: "color", 4: "custom"}
@@ -43,8 +55,12 @@ class LightState:
     off_time: str | None = None
 
     @property
-    def on(self) -> bool:
-        return self.control == MANUAL_ON
+    def forced_on(self) -> bool:
+        return (
+            self.control == TIMED
+            and self.on_time == ALWAYS_ON_FROM
+            and self.off_time == ALWAYS_ON_UNTIL
+        )
 
 
 @dataclass(frozen=True)
@@ -52,6 +68,7 @@ class Detection:
     person: bool
     vehicle: bool
     motion: bool
+    sensitivity: int | None = None
 
 
 class HttpClient:
@@ -71,6 +88,7 @@ class HttpClient:
         self._session = session
         self._owns_session = session is None
         self._login_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._session_id: str | None = None
         self._digest: aiohttp.DigestAuthMiddleware | None = None
 
@@ -82,12 +100,26 @@ class HttpClient:
     async def get_light(self, *, channel: int = 1) -> LightState:
         return _light_state(await self._request("GET", _path(_LIGHT, channel)))
 
-    async def set_light(self, on: bool, *, channel: int = 1) -> None:
+    async def force_light_on(self, power: int, *, channel: int = 1) -> None:
+        if not 1 <= power <= 100:
+            raise ValueError(f"lamp power must be 1 to 100, got {power}")
+        body = _xml(
+            "WhiteLight",
+            [
+                ("contrltype", TIMED),
+                ("infraredFarLampPower", power),
+                ("infraredLampPower", power),
+                ("sunRiseTime", ALWAYS_ON_UNTIL),
+                ("sunSetTime", ALWAYS_ON_FROM),
+            ],
+        )
+        await self._write(_path(_LIGHT, channel), body)
+
+    async def release_light(self, *, channel: int = 1) -> None:
         path = _path(_LIGHT, channel)
-        state = _light_state(await self._request("GET", path))
-        # off returns to auto, not manual off, so smart mode can still light up
-        control = MANUAL_ON if on else AUTO
-        await self._write(path, _light_body(state, control))
+        async with self._write_lock:
+            state = _light_state(await self._request("GET", path))
+            await self._write(path, _light_body(state, AUTO))
 
     async def get_light_mode(self, *, channel: int = 1) -> str:
         raw = await self._request("GET", _path(_MODE, channel))
@@ -114,6 +146,7 @@ class HttpClient:
             person=_flag(root, "enabled"),
             vehicle=_flag(root, "carEnabled"),
             motion=_flag(root, "allEnabled"),
+            sensitivity=_int_at(root, _SENSITIVITY),
         )
 
     async def set_detection(
@@ -129,13 +162,14 @@ class HttpClient:
         changes = {name: value for name, value in changes.items() if value is not None}
         if not changes:
             return
-        root = _parse(await self._request("GET", path), "MotionDetection")
-        for name, value in changes.items():
-            element = root.find(name)
-            if element is None:
-                element = ET.SubElement(root, name)
-            element.text = "true" if value else "false"
-        await self._write(path, _serialize(root))
+        async with self._write_lock:
+            root = _parse(await self._request("GET", path), "MotionDetection")
+            for name, value in changes.items():
+                element = root.find(name)
+                if element is None:
+                    element = ET.SubElement(root, name)
+                element.text = "true" if value else "false"
+            await self._write(path, _serialize(root))
 
     async def get_capabilities(self, *, channel: int = 1) -> dict[str, bool]:
         raw = await self._request(
@@ -154,6 +188,82 @@ class HttpClient:
             "vehicle": "car" in found,
             "motion": "all" in found,
         }
+
+    async def get_sound_count(self, *, channel: int = 1) -> int:
+        raw = await self._request("POST", _path(_CAPABILITIES, channel), _SOUND_QUERY)
+        for cap in _parse(raw, "ChanBasicCapList").iter("capTypeList"):
+            if _text(cap, "capType") == "guardSound" and _flag(cap, "support"):
+                return _int_at(cap, "subCap/supportSoundSampleNum") or 0
+        return 0
+
+    async def play_sound(self, sample: int, *, channel: int = 1) -> None:
+        await self._play_audio(sample, _PLAY, channel)
+
+    async def stop_sound(self, sample: int, *, channel: int = 1) -> None:
+        await self._play_audio(sample, _STOP, channel)
+
+    async def get_siren_on_event(self, *, channel: int = 1) -> bool:
+        raw = await self._request("GET", _path(_VMD_TRIGGER, channel))
+        root = _parse(raw, "EventTrigger")
+        return any(
+            _text(link, "notificationMethod") == _GUARD_SOUND
+            for link in root.iter("EventTriggerNotification")
+        )
+
+    async def set_siren_on_event(
+        self, on: bool, *, sound: int = 1, channel: int = 1
+    ) -> None:
+        path = _path(_VMD_TRIGGER, channel)
+        async with self._write_lock:
+            root = _parse(await self._request("GET", path), "EventTrigger")
+            links = root.find("EventTriggerNotificationList")
+            if links is None:
+                links = ET.SubElement(root, "EventTriggerNotificationList")
+            for link in list(links):
+                if _text(link, "notificationMethod") == _GUARD_SOUND:
+                    links.remove(link)
+            if on:
+                # body as the camera web UI writes it
+                # (app.min.js, EventTriggerNotification)
+                link = ET.SubElement(links, "EventTriggerNotification")
+                ET.SubElement(link, "id").text = f"{_GUARD_SOUND}-{sound}"
+                ET.SubElement(link, "notificationMethod").text = _GUARD_SOUND
+                ET.SubElement(link, "SoundID").text = str(sound)
+            await self._write(path, _serialize(root))
+
+    async def get_volume(self, *, channel: int = 1) -> int:
+        raw = await self._request("GET", _path(_TWO_WAY_AUDIO, channel))
+        volume = _int(_parse(raw, "TwoWayAudioChannel"), "outputVolume")
+        if volume is None:
+            raise ProtocolError("TwoWayAudioChannel reply has no outputVolume")
+        return volume
+
+    async def set_volume(self, volume: int, *, channel: int = 1) -> None:
+        if not 0 <= volume <= 100:
+            raise ValueError(f"volume must be 0 to 100, got {volume}")
+        path = _path(_TWO_WAY_AUDIO, channel)
+        async with self._write_lock:
+            root = _parse(await self._request("GET", path), "TwoWayAudioChannel")
+            _set_text(root, "outputVolume", str(volume))
+            await self._write(path, _serialize(_without_options(root)))
+
+    async def set_sensitivity(self, level: int, *, channel: int = 1) -> None:
+        if not 0 <= level <= 100:
+            raise ValueError(f"sensitivity must be 0 to 100, got {level}")
+        path = _path(_DETECTION, channel)
+        async with self._write_lock:
+            root = _parse(await self._request("GET", path), "MotionDetection")
+            _set_text(root, _SENSITIVITY, str(level))
+            await self._write(path, _serialize(_without_options(root)))
+
+    async def _play_audio(self, sample: int, action: int, channel: int) -> None:
+        if sample < 0:
+            raise ValueError(f"sound sample must be 0 or more, got {sample}")
+        body = _xml(
+            "PlayAudioInfo",
+            [("channelID", channel), ("type", 0), ("sampleNo", sample), ("action", action)],
+        )
+        await self._write(_PLAY_AUDIO, body)
 
     async def get_device_info(self) -> dict[str, str | None]:
         # the bean carries firmware only; model, serial and mac are absent on this
@@ -317,7 +427,14 @@ def _text(parent: ET.Element, name: str) -> str | None:
 
 
 def _int(parent: ET.Element, name: str) -> int | None:
-    text = _text(parent, name)
+    return _int_text(name, _text(parent, name))
+
+
+def _int_at(parent: ET.Element, path: str) -> int | None:
+    return _int_text(path, _text(parent, path))
+
+
+def _int_text(name: str, text: str | None) -> int | None:
     if not text:
         return None
     try:
@@ -328,6 +445,21 @@ def _int(parent: ET.Element, name: str) -> int | None:
 
 def _flag(parent: ET.Element, name: str) -> bool:
     return _text(parent, name) == "true"
+
+
+def _set_text(root: ET.Element, path: str, text: str) -> None:
+    node = root
+    for name in path.split("/"):
+        child = node.find(name)
+        node = ET.SubElement(node, name) if child is None else child
+    node.text = text
+
+
+def _without_options(root: ET.Element) -> ET.Element:
+    # the camera wants plain values back, without the opt lists it sends
+    for node in root.iter():
+        node.attrib.pop("opt", None)
+    return root
 
 
 def _light_state(raw: bytes) -> LightState:

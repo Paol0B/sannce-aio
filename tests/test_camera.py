@@ -1,6 +1,6 @@
 import asyncio
+import logging
 import socket
-import struct
 from urllib.parse import unquote, urlsplit
 
 import aiohttp
@@ -12,25 +12,20 @@ from sannce_aio import (
     CameraInfo,
     ConnectError,
     Event,
+    Floodlight,
+    ProtocolError,
     SannceCamera,
     TalkBusyError,
 )
-from sannce_aio.audio import SUBFRAME_PCM_BYTES, encode_alaw
+
+from .rtsp_fake import FakeRtspCamera
 
 pytestmark = pytest.mark.asyncio
 
+USER = "admin"
+PASSWORD = "admin123"
 MOTION_START = ["INNER", "ALARM", "MOTIONDETECT", "0", "1"]
 MOTION_STOP = ["INNER", "ALARM", "MOTIONDETECT", "0", "0"]
-PCM = struct.pack("<240h", *range(-12000, 12000, 100))
-SUBFRAMES = [
-    encode_alaw(PCM[start : start + SUBFRAME_PCM_BYTES])
-    for start in range(0, len(PCM), SUBFRAME_PCM_BYTES)
-]
-OTHER_PCM = struct.pack("<240h", *range(12000, -12000, -100))
-OTHER_SUBFRAMES = [
-    encode_alaw(OTHER_PCM[start : start + SUBFRAME_PCM_BYTES])
-    for start in range(0, len(OTHER_PCM), SUBFRAME_PCM_BYTES)
-]
 
 
 async def wait_until(predicate, timeout=3.0):
@@ -46,10 +41,6 @@ async def wait_until(predicate, timeout=3.0):
 async def async_iter(chunks):
     for chunk in chunks:
         yield chunk
-
-
-def talk_actions(simulator):
-    return [fields[6] for fields in simulator.requests if fields[1:2] == ["NVR"]]
 
 
 def unused_port():
@@ -71,19 +62,32 @@ def track_closed_sessions(monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def make_camera(simulator):
+async def rtsp():
+    camera = FakeRtspCamera(username=USER, password=PASSWORD)
+    await camera.start()
+    yield camera
+    await camera.stop()
+
+
+@pytest_asyncio.fixture
+async def make_camera(simulator, rtsp):
     created = []
 
-    def make(*, username=None, password=None, event_timeout=10.0, http_port=None):
+    async def make(
+        *, connect=True, username=None, password=None, event_timeout=10.0, http_port=None
+    ):
         camera = SannceCamera(
             simulator.host,
             simulator.username if username is None else username,
             simulator.password if password is None else password,
             nvs_port=simulator.port,
             http_port=simulator.http_port if http_port is None else http_port,
+            rtsp_port=rtsp.port,
             event_timeout=event_timeout,
         )
         created.append(camera)
+        if connect:
+            await camera.connect()
         return camera
 
     yield make
@@ -92,7 +96,7 @@ async def make_camera(simulator):
 
 
 async def test_connect_populates_info_and_caps(make_camera):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
 
     await camera.connect()
 
@@ -103,12 +107,13 @@ async def test_connect_populates_info_and_caps(make_camera):
         "motion",
         "white_light",
         "light_mode",
-        "talk",
+        "speaker",
     } <= camera.caps
+    assert "talk" not in camera.caps
 
 
 async def test_connect_bad_credentials_raises_auth_error(make_camera):
-    camera = make_camera(password="wrong")
+    camera = await make_camera(connect=False, password="wrong")
 
     with pytest.raises(AuthError):
         await camera.connect()
@@ -117,7 +122,7 @@ async def test_connect_bad_credentials_raises_auth_error(make_camera):
 async def test_connect_closes_owned_http_session_when_nvs_fails(
     simulator, make_camera, monkeypatch
 ):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
     captured = {}
 
     async def fail(*_args, **_kwargs):
@@ -163,7 +168,7 @@ async def test_connect_closes_owned_http_session_when_http_fails(
     make_camera, monkeypatch
 ):
     closed = track_closed_sessions(monkeypatch)
-    camera = make_camera(http_port=unused_port())
+    camera = await make_camera(connect=False, http_port=unused_port())
 
     with pytest.raises(ConnectError):
         await camera.connect()
@@ -194,7 +199,7 @@ async def test_connect_keeps_caller_session_when_http_fails(simulator):
 async def test_connect_cancelled_after_login_closes_the_connection(
     simulator, make_camera, monkeypatch
 ):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
     probing = asyncio.Event()
 
     async def hang(*_args, **_kwargs):
@@ -213,29 +218,190 @@ async def test_connect_cancelled_after_login_closes_the_connection(
     assert camera._http._session is None
 
 
-async def test_set_light_reaches_the_http_side(simulator, make_camera):
-    camera = make_camera()
+PROBES = ["get_light", "get_light_mode", "get_volume", "get_siren_on_event", "get_sound_count"]
+
+
+@pytest.mark.parametrize("probe", PROBES)
+async def test_an_unreachable_cap_probe_fails_the_connect(
+    simulator, make_camera, monkeypatch, probe
+):
+    camera = await make_camera(connect=False)
+
+    async def unreachable(*_args, **_kwargs):
+        raise ConnectError("timed out")
+
+    monkeypatch.setattr(camera._http, probe, unreachable)
+
+    with pytest.raises(ConnectError, match="timed out"):
+        await camera.connect()
+    await wait_until(lambda: simulator.clients == 0)
+
+
+async def test_an_unreachable_rtsp_port_fails_the_connect(simulator):
+    camera = SannceCamera(
+        simulator.host, USER, PASSWORD,
+        nvs_port=simulator.port, http_port=simulator.http_port, rtsp_port=unused_port(),
+    )
+
+    with pytest.raises(ConnectError):
+        await camera.connect()
+    await wait_until(lambda: simulator.clients == 0)
+
+
+@pytest.mark.parametrize(
+    ("probe", "cap"),
+    [
+        ("get_light", "white_light"),
+        ("get_light_mode", "light_mode"),
+        ("get_volume", "volume"),
+        ("get_siren_on_event", "siren_on_event"),
+        ("get_sound_count", "siren"),
+    ],
+)
+async def test_a_refused_cap_probe_leaves_the_cap_out(
+    make_camera, monkeypatch, caplog, probe, cap
+):
+    camera = await make_camera(connect=False)
+
+    async def refuse(*_args, **_kwargs):
+        raise ProtocolError("HTTP 404")
+
+    monkeypatch.setattr(camera._http, probe, refuse)
+    caplog.set_level(logging.DEBUG, logger="sannce_aio.camera")
+
     await camera.connect()
 
-    await camera.set_light(True)
-    assert simulator.light_control == 1
-    assert await camera.get_light() is True
-
-    await camera.set_light(False)
-    assert simulator.light_control == 0
-    assert await camera.get_light() is False
+    assert cap not in camera.caps
+    assert f"no {cap}: HTTP 404" in caplog.text
 
 
-async def test_rtsp_url_main_and_sub(simulator, make_camera):
-    camera = make_camera()
-    base = f"rtsp://{simulator.username}:{simulator.password}@{simulator.host}:554"
+async def test_floodlight_on_switches_to_color_and_forces_the_lamp(simulator, make_camera):
+    camera = await make_camera()
+    simulator.light_mode = 2
+
+    await camera.set_floodlight(True, brightness=40)
+
+    assert simulator.light_mode == 3
+    assert simulator.lamp_on is True
+    assert simulator.light_power == 40
+    assert await camera.get_floodlight() == Floodlight(on=True, brightness=40)
+
+
+async def test_floodlight_on_keeps_custom_mode(simulator, make_camera):
+    camera = await make_camera()
+    simulator.light_mode = 4
+
+    await camera.set_floodlight(True)
+
+    assert simulator.light_mode == 4
+    assert simulator.lamp_on is True
+
+
+async def test_floodlight_on_without_brightness_keeps_the_power(simulator, make_camera):
+    camera = await make_camera()
+    simulator.light_power = 70
+
+    await camera.set_floodlight(True)
+
+    assert simulator.light_power == 70
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+async def test_a_refused_force_on_restores_the_mode(simulator, make_camera, monkeypatch, mode):
+    camera = await make_camera()
+    simulator.light_mode = mode
+
+    async def refuse(*_args, **_kwargs):
+        raise ProtocolError("PUT refused")
+
+    monkeypatch.setattr(camera._http, "force_light_on", refuse)
+
+    with pytest.raises(ProtocolError, match="PUT refused"):
+        await camera.set_floodlight(True)
+
+    assert simulator.light_mode == mode
+    assert simulator.lamp_on is False
+
+
+async def test_a_failed_restore_keeps_the_force_on_error(make_camera, monkeypatch, caplog):
+    camera = await make_camera()
+    set_mode = camera._http.set_light_mode
+    modes = []
+
+    async def refuse(*_args, **_kwargs):
+        raise ProtocolError("PUT refused")
+
+    async def drop_the_second(mode, **kwargs):
+        modes.append(mode)
+        if len(modes) > 1:
+            raise ConnectError("camera gone")
+        await set_mode(mode, **kwargs)
+
+    monkeypatch.setattr(camera._http, "force_light_on", refuse)
+    monkeypatch.setattr(camera._http, "set_light_mode", drop_the_second)
+
+    with pytest.raises(ProtocolError, match="PUT refused"):
+        await camera.set_floodlight(True)
+
+    assert modes == ["color", "smart"]
+    assert "cannot restore light mode smart" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("base", "mode", "control"), [("smart", 2, 2), ("infrared", 1, 2), ("color", 3, 0)]
+)
+async def test_floodlight_off_returns_to_the_base_mode(
+    simulator, make_camera, base, mode, control
+):
+    camera = await make_camera()
+    await camera.set_floodlight(True)
+
+    await camera.set_floodlight(False, base_mode=base)
+
+    assert simulator.light_mode == mode
+    assert simulator.light_control == control
+    assert (await camera.get_floodlight()).on is False
+
+
+async def test_sounds_reach_the_camera(simulator, make_camera):
+    camera = await make_camera()
+
+    await camera.play_sound(1)
+    await camera.stop_sound(1)
+
+    assert camera.sound_count == 3
+    assert simulator.sounds == [(1, 1), (1, 0)]
+
+
+async def test_volume_siren_link_and_sensitivity_reach_the_camera(simulator, make_camera):
+    camera = await make_camera()
+
+    await camera.set_volume(30)
+    await camera.set_siren_on_event(True)
+    await camera.set_sensitivity(90)
+
+    assert simulator.volume == 30
+    assert await camera.get_volume() == 30
+    assert simulator.siren_on_event is True
+    assert await camera.get_siren_on_event() is True
+    assert (await camera.get_detection()).sensitivity == 90
+
+
+async def test_connect_reports_the_new_caps(make_camera):
+    camera = await make_camera()
+    assert {"volume", "siren", "siren_on_event", "speaker", "white_light", "light_mode"} <= camera.caps
+
+
+async def test_rtsp_url_main_and_sub(simulator, rtsp, make_camera):
+    camera = await make_camera(connect=False)
+    base = f"rtsp://{simulator.username}:{simulator.password}@{simulator.host}:{rtsp.port}"
 
     assert camera.rtsp_url("main") == base + "/1/1"
     assert camera.rtsp_url("sub") == base + "/1/2"
 
 
 async def test_rtsp_url_rejects_unknown_stream(make_camera):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
 
     with pytest.raises(ValueError):
         camera.rtsp_url("high")
@@ -267,8 +433,7 @@ async def test_constructor_rejects_bad_host(host):
 
 
 async def test_subscribe_receives_start_then_autoclear(simulator, make_camera):
-    camera = make_camera(event_timeout=0.1)
-    await camera.connect()
+    camera = await make_camera(event_timeout=0.1)
     seen = []
     camera.subscribe(seen.append)
 
@@ -281,8 +446,7 @@ async def test_subscribe_receives_start_then_autoclear(simulator, make_camera):
 
 
 async def test_event_autoclear_cancelled_by_real_stop(simulator, make_camera):
-    camera = make_camera(event_timeout=0.2)
-    await camera.connect()
+    camera = await make_camera(event_timeout=0.2)
     seen = []
     camera.subscribe(seen.append)
 
@@ -297,8 +461,7 @@ async def test_event_autoclear_cancelled_by_real_stop(simulator, make_camera):
 
 
 async def test_close_cancels_pending_autoclear(simulator, make_camera):
-    camera = make_camera(event_timeout=0.2)
-    await camera.connect()
+    camera = await make_camera(event_timeout=0.2)
     seen = []
     camera.subscribe(seen.append)
 
@@ -311,8 +474,7 @@ async def test_close_cancels_pending_autoclear(simulator, make_camera):
 
 
 async def test_unsubscribe_stops_delivery(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
+    camera = await make_camera()
     seen = []
     unsub = camera.subscribe(seen.append)
 
@@ -326,8 +488,7 @@ async def test_unsubscribe_stops_delivery(simulator, make_camera):
 
 
 async def test_raising_subscriber_does_not_block_others(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
+    camera = await make_camera()
     good = []
 
     def bad(_event):
@@ -341,7 +502,7 @@ async def test_raising_subscriber_does_not_block_others(simulator, make_camera):
 
 
 async def test_on_availability_reports_up_then_down(make_camera):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
     states = []
     camera.on_availability(states.append)
 
@@ -353,7 +514,7 @@ async def test_on_availability_reports_up_then_down(make_camera):
 
 
 async def test_on_login_failed_reports_a_refused_reconnect(simulator, make_camera):
-    camera = make_camera()
+    camera = await make_camera(connect=False)
     failures = []
     states = []
     camera.on_login_failed(failures.append)
@@ -364,7 +525,7 @@ async def test_on_login_failed_reports_a_refused_reconnect(simulator, make_camer
     simulator.password = "changed"
 
     for session in list(simulator._sessions):
-        session.writer.close()
+        await session.ws.close()
     await wait_until(lambda: failures, timeout=5.0)
 
     assert len(failures) == 1
@@ -372,115 +533,91 @@ async def test_on_login_failed_reports_a_refused_reconnect(simulator, make_camer
     assert states == [True, False]
 
 
-async def test_play_audio_streams_rechunked_frames_and_stops_talk(
-    simulator, make_camera
-):
-    camera = make_camera()
-    await camera.connect()
+async def test_play_audio_streams_through_the_backchannel(make_camera, rtsp):
+    camera = await make_camera()
+    await camera.play_audio(async_iter([b"\x01\x00" * 160, b"\x01\x00" * 100]))
 
-    await camera.play_audio(async_iter([PCM[:100], PCM[100:300], PCM[300:]]))
-
-    assert simulator.talk_frames == SUBFRAMES
-    assert not simulator.talking
+    await wait_until(lambda: rtsp.requests[-1][0] == "TEARDOWN")
+    assert [ch for ch, _ in rtsp.packets] == [4, 4]
 
 
-async def test_play_audio_zero_pads_a_trailing_partial_frame(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
-    pcm = PCM[: SUBFRAME_PCM_BYTES + 80]
-
-    await camera.play_audio(async_iter([pcm]))
-
-    padded = pcm[SUBFRAME_PCM_BYTES:] + bytes(SUBFRAME_PCM_BYTES - 80)
-    assert simulator.talk_frames == [
-        encode_alaw(pcm[:SUBFRAME_PCM_BYTES]),
-        encode_alaw(padded),
-    ]
-    assert not simulator.talking
-
-
-async def test_play_audio_raises_busy_when_talk_is_held(simulator, make_camera):
-    simulator.set_talk_busy(True)
-    camera = make_camera()
-    await camera.connect()
-
+async def test_play_audio_raises_busy_when_the_camera_refuses(simulator, rtsp, make_camera):
+    camera = await make_camera()
+    rtsp.setup_status = 453
     with pytest.raises(TalkBusyError):
-        await camera.play_audio(async_iter([PCM]))
-
-    assert not simulator.talking
+        await camera.play_audio(async_iter([b"\x00" * 320]))
 
 
-async def test_play_audio_stops_talk_on_producer_error(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
+async def test_play_audio_tears_down_on_producer_error(make_camera, rtsp):
+    camera = await make_camera()
 
-    async def producer():
-        yield PCM
-        raise RuntimeError("producer boom")
+    async def failing():
+        yield b"\x00" * 320
+        raise RuntimeError("producer broke")
 
     with pytest.raises(RuntimeError):
-        await camera.play_audio(producer())
+        await camera.play_audio(failing())
+    await asyncio.sleep(0.05)
+    assert rtsp.requests[-1][0] == "TEARDOWN"
 
-    await wait_until(lambda: not simulator.talking)
 
-
-async def test_play_audio_stops_talk_on_cancel(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
+async def test_cancelling_play_audio_tears_down_and_frees_the_speaker(make_camera, rtsp):
+    camera = await make_camera()
     started = asyncio.Event()
 
     async def producer():
-        yield PCM
+        yield b"\x00" * 320
         started.set()
         await asyncio.sleep(10)
-        yield PCM
+        yield b"\x00" * 320
 
     task = asyncio.create_task(camera.play_audio(producer()))
-    await started.wait()
-    await wait_until(lambda: simulator.talking)
-
+    await asyncio.wait_for(started.wait(), 5.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 5.0)
 
-    await wait_until(lambda: not simulator.talking)
+    await wait_until(lambda: rtsp.requests[-1][0] == "TEARDOWN")
+    await asyncio.wait_for(camera.play_audio(async_iter([b"\x00" * 320])), 5.0)
+    assert len(rtsp.packets) == 2
 
 
-async def test_overlapping_play_audio_calls_run_one_after_the_other(
-    simulator, make_camera
-):
-    camera = make_camera()
-    await camera.connect()
+async def test_overlapping_play_audio_calls_run_one_after_the_other(make_camera, rtsp):
+    camera = await make_camera()
     streaming = asyncio.Event()
     release = asyncio.Event()
 
-    async def first():
-        yield PCM[:SUBFRAME_PCM_BYTES]
+    async def held():
+        yield b"\x00" * 320
         streaming.set()
         await release.wait()
-        yield PCM[SUBFRAME_PCM_BYTES:]
+        yield b"\x00" * 320
 
-    one = asyncio.create_task(camera.play_audio(first()))
+    def setups():
+        return [m for m, _, h in rtsp.requests if m == "SETUP" and "authorization" in h]
+
+    first = asyncio.create_task(camera.play_audio(held()))
     await asyncio.wait_for(streaming.wait(), 5.0)
-    two = asyncio.create_task(camera.play_audio(async_iter([OTHER_PCM])))
-    await asyncio.sleep(0.05)
-    assert not two.done()
+    second = asyncio.create_task(camera.play_audio(async_iter([b"\x00" * 320])))
+    await asyncio.sleep(0.2)
+    assert len(setups()) == 1
+    assert not second.done()
 
     release.set()
-    await asyncio.wait_for(asyncio.gather(one, two), 5.0)
-
-    assert simulator.talk_frames == SUBFRAMES + OTHER_SUBFRAMES
-    assert talk_actions(simulator) == ["BEGIN", "END", "BEGIN", "END"]
-    assert not simulator.talking
+    await asyncio.wait_for(asyncio.gather(first, second), 5.0)
+    assert len(setups()) == 2
 
 
-async def test_rejected_play_audio_does_not_end_a_running_talk(simulator, make_camera):
-    camera = make_camera()
-    await camera.connect()
-    await camera._conn.start_talk(0)
-
-    with pytest.raises(TalkBusyError):
-        await camera.play_audio(async_iter([PCM]))
-
-    assert simulator.talking
-    assert talk_actions(simulator) == ["BEGIN"]
+async def test_a_camera_without_a_backchannel_has_no_speaker_cap(simulator):
+    rtsp = FakeRtspCamera(username=USER, password=PASSWORD, backchannel=False)
+    await rtsp.start()
+    camera = SannceCamera(
+        simulator.host, USER, PASSWORD,
+        nvs_port=simulator.port, http_port=simulator.http_port, rtsp_port=rtsp.port,
+    )
+    try:
+        await camera.connect()
+        assert "speaker" not in camera.caps
+    finally:
+        await camera.close()
+        await rtsp.stop()

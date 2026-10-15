@@ -1,25 +1,10 @@
-import ipaddress
 import struct
 from bisect import bisect_left
 from collections.abc import Callable
 
-from .protocol import build_data
-
-G711A = 1
-G711U = 2
-
-# 4 per 640-byte app frame (protocol.md, Codecs, sample rate, frame size and pacing)
-_SUBFRAME_SAMPLES = 80
-SUBFRAME_PCM_BYTES = 2 * _SUBFRAME_SAMPLES
-
 _ALAW_SEGMENT_END = (0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF)
 _ULAW_SEGMENT_END = (0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF)
 _ULAW_BIAS = 33
-
-_CHANNEL = 0
-_TALK_HEAD = b"NVR\x00\t" + bytes([_CHANNEL]) + b"\t\x00\tNVS\x00"
-# the code is half the audio byte count (protocol.md, Audio frame layout)
-_SUBHEADER = bytes([0x00, 0x01, _SUBFRAME_SAMPLES // 2, 0x00])
 
 
 def _alaw(sample: int) -> int:
@@ -80,21 +65,15 @@ def decode_alaw(data: bytes) -> bytes:
     return struct.pack(f"<{len(data)}h", *(_ALAW_SAMPLES[code] for code in data))
 
 
-_ENCODERS = {G711A: encode_alaw, G711U: encode_ulaw}
+def _ulaw_sample(code: int) -> int:
+    code = ~code & 0xFF
+    value = (((code & 0x0F) << 1) + _ULAW_BIAS) << ((code & 0x70) >> 4)
+    value -= _ULAW_BIAS
+    return (-value if code & 0x80 else value) << 2
 
 
-def frame_talk_audio(pcm: bytes, codec: int, seq: int, ip: str) -> bytes:
-    encode = _ENCODERS.get(codec)
-    if encode is None:
-        raise ValueError(f"unsupported codec {codec}")
-    if len(pcm) % SUBFRAME_PCM_BYTES:
-        raise ValueError(
-            f"pcm length {len(pcm)} is not a multiple of {SUBFRAME_PCM_BYTES}"
-        )
-    # NVS block IP is byte-reversed, header IP is not (protocol.md, Audio frame layout)
-    head = _TALK_HEAD + ipaddress.IPv4Address(ip).packed[::-1] + _SUBHEADER
-    packets = []
-    for index, start in enumerate(range(0, len(pcm), SUBFRAME_PCM_BYTES)):
-        audio = encode(pcm[start : start + SUBFRAME_PCM_BYTES])
-        packets.append(build_data(head + audio, seq + index, ip))
-    return b"".join(packets)
+_ULAW_SAMPLES = [_ulaw_sample(code) for code in range(256)]
+
+
+def decode_ulaw(data: bytes) -> bytes:
+    return struct.pack(f"<{len(data)}h", *(_ULAW_SAMPLES[code] for code in data))

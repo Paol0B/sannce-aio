@@ -1,4 +1,4 @@
-from .camera import CameraInfo, SannceCamera
+from .camera import CameraInfo, Floodlight, SannceCamera
 from .discovery import DiscoveredCamera, discover, find_camera
 from .errors import (
     AuthError,
@@ -9,6 +9,7 @@ from .errors import (
 )
 from .events import Event
 from .http import Detection
+from .relay import RtspRelay
 
 __all__ = [
     "AuthError",
@@ -17,7 +18,9 @@ __all__ = [
     "Detection",
     "DiscoveredCamera",
     "Event",
+    "Floodlight",
     "ProtocolError",
+    "RtspRelay",
     "SannceCamera",
     "SannceError",
     "TalkBusyError",

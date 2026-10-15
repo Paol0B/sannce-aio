@@ -46,6 +46,50 @@ EXTRA_DETECTION = (
 )
 
 
+WHITE_LIGHT = (
+    '<WhiteLight><contrltype opt="0,2,3">2</contrltype>'
+    "<sunRiseTime>07:00:00</sunRiseTime><sunSetTime>17:00:00</sunSetTime>"
+    "<infraredLampPower>60</infraredLampPower>"
+    "<infraredFarLampPower>60</infraredFarLampPower></WhiteLight>"
+)
+FORCED_ON = (
+    '<WhiteLight><contrltype opt="0,2,3">3</contrltype>'
+    "<sunRiseTime>23:59:00</sunRiseTime><sunSetTime>00:00:00</sunSetTime>"
+    "<infraredLampPower>40</infraredLampPower>"
+    "<infraredFarLampPower>40</infraredFarLampPower></WhiteLight>"
+)
+GUARD_SOUND_CAPS = (
+    "<ChanBasicCapList><capTypeList><capType>guardSound</capType><support>true</support>"
+    "<subCap><supportSoundSampleNum>3</supportSoundSampleNum>"
+    "<supportSoundCustomNum>2</supportSoundCustomNum></subCap></capTypeList></ChanBasicCapList>"
+)
+VMD_TRIGGER = (
+    "<EventTrigger><id>VMD</id><enabled>true</enabled><eventType></eventType>"
+    "<EventTriggerNotificationList><EventTriggerNotification><id>whiteLampForBody</id>"
+    "<notificationMethod>whiteLampForBody</notificationMethod></EventTriggerNotification>"
+    "</EventTriggerNotificationList></EventTrigger>"
+)
+TWO_WAY_AUDIO = (
+    "<TwoWayAudioChannel><id>1</id>"
+    '<audioCompressionType opt="G.711A,G.711U">G.711A</audioCompressionType>'
+    "<speakerVolume>80</speakerVolume><enabled>true</enabled>"
+    '<audioOutputType opt="close,innerspeaker">innerspeaker</audioOutputType>'
+    "<outputVolume>80</outputVolume></TwoWayAudioChannel>"
+)
+LIGHT = "/ISAPI/Image/channels/1/WhiteLight"
+PLAY_AUDIO = "/CGI/Event/PlayAudio"
+VMD = "/ISAPI/Event/triggers/VMD/channels/1"
+AUDIO = "/ISAPI/System/TwoWayAudio/channels/1"
+DETECTION = "/ISAPI/System/Video/inputs/channels/1/motionDetection"
+CAPS = "/CGI/System/channels/1/capabilities"
+
+
+def put_body(camera, path):
+    return ET.fromstring(
+        next(s.body for s in reversed(camera.sent("PUT")) if s.path == path)
+    )
+
+
 @dataclass(frozen=True)
 class Example:
     method: str
@@ -99,6 +143,7 @@ class FakeCamera:
         self.denied_status = 401
         self.password = PASSWORD
         self.hold_user_check = False
+        self.echo_writes = False
         self.user_check_seen = asyncio.Event()
         self.release = asyncio.Event()
         self.port = None
@@ -134,6 +179,11 @@ class FakeCamera:
         if seen.path == USER_CHECK and self.hold_user_check:
             self.user_check_seen.set()
             await self.release.wait()
+        if self.echo_writes:
+            if seen.method == "PUT":
+                self.serve("GET", seen.path, seen.body)
+            else:
+                await asyncio.sleep(0.01)
         return self.reply(*self.replies.get((seen.method, seen.path), (404, "")))
 
     def session_check_reply(self):
@@ -271,46 +321,21 @@ async def test_get_light_parses_example(examples, camera, client):
     )
 
 
-@pytest.mark.parametrize(
-    ("control", "on"), [("0", False), ("1", True), ("2", False), ("3", False)]
-)
-async def test_light_is_on_only_in_manual_on(examples, camera, client, control, on):
-    reply = load(examples, "http_whitelight_get_reply")
-    body = edit(reply.body, ('opt="0,1,2,3">0<', f'opt="0,1,2,3">{control}<'))
-    camera.serve("GET", reply.path, body)
-
-    state = await client.get_light()
-
-    assert state.control == int(control)
-    assert state.on is on
-
-
-async def test_set_light_on_sends_example_body(examples, camera, client):
+async def test_release_light_returns_to_auto(examples, camera, client):
     get = load(examples, "http_whitelight_get_reply")
     put = load(examples, "http_whitelight_set_manual_on")
     camera.serve_reply(get)
     camera.serve(put.method, put.path, WRITE_OK)
 
-    await client.set_light(True)
+    await client.release_light()
 
     (sent,) = camera.sent("PUT")
-    assert (sent.method, sent.path, sent.body) == (put.method, put.path, put.body)
+    assert (sent.method, sent.path) == (put.method, put.path)
     assert sent.headers["Content-Type"] == put.headers["Content-Type"]
-
-
-async def test_set_light_off_returns_to_auto(examples, camera, client):
-    get = load(examples, "http_whitelight_get_reply")
-    put = load(examples, "http_whitelight_set_manual_on")
-    camera.serve_reply(get)
-    camera.serve(put.method, put.path, WRITE_OK)
-
-    await client.set_light(False)
-
-    (sent,) = camera.sent("PUT")
     assert sent.body == edit(put.body, ("<contrltype>1<", "<contrltype>0<"))
 
 
-async def test_set_light_echoes_values_from_the_last_read(examples, camera, client):
+async def test_release_light_echoes_values_from_the_last_read(examples, camera, client):
     get = load(examples, "http_whitelight_get_reply")
     put = load(examples, "http_whitelight_set_manual_on")
     changes = [
@@ -322,13 +347,13 @@ async def test_set_light_echoes_values_from_the_last_read(examples, camera, clie
     camera.serve("GET", get.path, edit(get.body, *changes))
     camera.serve(put.method, put.path, WRITE_OK)
 
-    await client.set_light(True)
+    await client.release_light()
 
     (sent,) = camera.sent("PUT")
-    assert sent.body == edit(put.body, *changes)
+    assert sent.body == edit(put.body, ("<contrltype>1<", "<contrltype>0<"), *changes)
 
 
-async def test_set_light_omits_times_the_camera_did_not_send(examples, camera, client):
+async def test_release_light_omits_times_the_camera_did_not_send(examples, camera, client):
     get = load(examples, "http_whitelight_get_reply")
     put = load(examples, "http_whitelight_set_manual_on")
     changes = [
@@ -338,10 +363,10 @@ async def test_set_light_omits_times_the_camera_did_not_send(examples, camera, c
     camera.serve("GET", get.path, edit(get.body, *changes))
     camera.serve(put.method, put.path, WRITE_OK)
 
-    await client.set_light(True)
+    await client.release_light()
 
     (sent,) = camera.sent("PUT")
-    assert sent.body == edit(put.body, *changes)
+    assert sent.body == edit(put.body, ("<contrltype>1<", "<contrltype>0<"), *changes)
 
 
 async def test_get_light_reads_an_empty_lamp_element_as_missing(
@@ -355,16 +380,18 @@ async def test_get_light_reads_an_empty_lamp_element_as_missing(
     assert (state.far_power, state.power) == (None, 100)
 
 
-async def test_set_light_leaves_out_an_empty_lamp_element(examples, camera, client):
+async def test_release_light_leaves_out_an_empty_lamp_element(examples, camera, client):
     get = load(examples, "http_whitelight_get_reply")
     put = load(examples, "http_whitelight_set_manual_on")
     camera.serve("GET", get.path, edit(get.body, EMPTY_FAR_LAMP))
     camera.serve(put.method, put.path, WRITE_OK)
 
-    await client.set_light(True)
+    await client.release_light()
 
     (sent,) = camera.sent("PUT")
-    assert sent.body == edit(put.body, (EMPTY_FAR_LAMP[0], ""))
+    assert sent.body == edit(
+        put.body, ("<contrltype>1<", "<contrltype>0<"), (EMPTY_FAR_LAMP[0], "")
+    )
 
 
 async def test_set_light_mode_smart_sends_example_body(examples, camera, client):
@@ -497,6 +524,22 @@ async def test_set_detection_writes_a_flag_the_reply_left_out(examples, camera, 
     assert sent.body == edit(body, (end, "<allEnabled>true</allEnabled>" + end))
 
 
+async def test_detection_and_sensitivity_writes_keep_both_changes(
+    examples, camera, client
+):
+    get = load(examples, "http_motion_detection_get_reply")
+    camera.serve_reply(get)
+    camera.serve("PUT", get.path, WRITE_OK)
+    camera.echo_writes = True
+
+    await asyncio.gather(
+        client.set_detection(person=False), client.set_sensitivity(50)
+    )
+
+    detection = await client.get_detection()
+    assert (detection.person, detection.sensitivity) == (False, 50)
+
+
 async def test_set_detection_without_flags_sends_nothing(camera, client):
     await client.set_detection()
 
@@ -530,7 +573,7 @@ async def test_refused_write_raises_protocol_error(examples, camera, client, rep
     camera.serve("PUT", get.path, reply)
 
     with pytest.raises(ProtocolError):
-        await client.set_light(True)
+        await client.release_light()
 
 
 @pytest.mark.parametrize("reply", ["", "OK"])
@@ -541,7 +584,7 @@ async def test_write_accepts_a_2xx_reply_without_a_status_document(
     camera.serve_reply(get)
     camera.serve("PUT", get.path, reply)
 
-    await client.set_light(True)
+    await client.release_light()
 
     assert len(camera.sent("PUT")) == 1
 
@@ -642,8 +685,8 @@ async def test_channel_selects_the_read_path(
     ("call", "kwargs", "read", "path"),
     [
         (
-            "set_light",
-            {"on": True},
+            "release_light",
+            {},
             "http_whitelight_get_reply",
             "/ISAPI/Image/channels/2/WhiteLight",
         ),
@@ -677,7 +720,7 @@ async def test_channel_selects_the_write_path(
     ("call", "kwargs"),
     [
         ("get_light", {}),
-        ("set_light", {"on": True}),
+        ("release_light", {}),
         ("get_light_mode", {}),
         ("set_light_mode", {"mode": "smart"}),
         ("get_detection", {}),
@@ -1019,3 +1062,185 @@ async def test_close_closes_the_session_it_created(
     await client.close()
 
     assert len(closed) == 1
+
+
+async def test_forced_on_is_the_full_day_timed_window(camera, client):
+    camera.serve("GET", LIGHT, FORCED_ON)
+    assert (await client.get_light()).forced_on is True
+
+
+async def test_an_ordinary_timed_window_is_not_forced_on(camera, client):
+    camera.serve("GET", LIGHT, FORCED_ON.replace("00:00:00", "18:00:00"))
+    assert (await client.get_light()).forced_on is False
+
+
+async def test_force_light_on_writes_the_full_day_window_and_power(camera, client):
+    camera.serve("PUT", LIGHT, WRITE_OK)
+
+    await client.force_light_on(40)
+
+    body = put_body(camera, LIGHT)
+    assert {child.tag: child.text for child in body} == {
+        "contrltype": "3",
+        "infraredFarLampPower": "40",
+        "infraredLampPower": "40",
+        "sunRiseTime": "23:59:00",
+        "sunSetTime": "00:00:00",
+    }
+
+
+@pytest.mark.parametrize("power", [0, 101])
+async def test_force_light_on_rejects_power_out_of_range(client, power):
+    with pytest.raises(ValueError):
+        await client.force_light_on(power)
+
+
+async def test_force_light_on_reports_a_refusal(camera, client):
+    camera.serve(
+        "PUT", LIGHT,
+        "<ResponseStatus><statusCode>3</statusCode><statusString>Device Error</statusString>"
+        "<subStatusCode>deviceError</subStatusCode></ResponseStatus>",
+    )
+    with pytest.raises(ProtocolError, match="Device Error"):
+        await client.force_light_on(100)
+
+
+async def test_release_light_writes_auto_and_keeps_the_rest(camera, client):
+    camera.serve("GET", LIGHT, WHITE_LIGHT)
+    camera.serve("PUT", LIGHT, WRITE_OK)
+
+    await client.release_light()
+
+    body = put_body(camera, LIGHT)
+    assert body.findtext("contrltype") == "0"
+    assert body.findtext("infraredLampPower") == "60"
+    assert body.find("contrltype").get("opt") is None
+
+
+async def test_get_sound_count_reads_the_guard_sound_capability(camera, client):
+    camera.serve("POST", CAPS, GUARD_SOUND_CAPS)
+    assert await client.get_sound_count() == 3
+
+
+async def test_get_sound_count_is_zero_without_support(camera, client):
+    camera.serve("POST", CAPS, GUARD_SOUND_CAPS.replace("<support>true", "<support>false"))
+    assert await client.get_sound_count() == 0
+
+
+@pytest.mark.parametrize(("call", "action"), [("play_sound", "1"), ("stop_sound", "0")])
+async def test_sound_calls_put_play_audio(camera, client, call, action):
+    camera.serve("PUT", PLAY_AUDIO, WRITE_OK)
+
+    await getattr(client, call)(2)
+
+    body = put_body(camera, PLAY_AUDIO)
+    assert [(c.tag, c.text) for c in body] == [
+        ("channelID", "1"), ("type", "0"), ("sampleNo", "2"), ("action", action),
+    ]
+
+
+async def test_play_sound_rejects_a_negative_sample(client):
+    with pytest.raises(ValueError):
+        await client.play_sound(-1)
+
+
+async def test_siren_on_event_reads_the_guard_sound_link(camera, client):
+    camera.serve("GET", VMD, VMD_TRIGGER)
+    assert await client.get_siren_on_event() is False
+
+
+async def test_set_siren_on_event_adds_the_link_and_keeps_the_others(camera, client):
+    camera.serve("GET", VMD, VMD_TRIGGER)
+    camera.serve("PUT", VMD, WRITE_OK)
+
+    await client.set_siren_on_event(True)
+
+    links = put_body(camera, VMD).findall("EventTriggerNotificationList/EventTriggerNotification")
+    assert [(n.findtext("id"), n.findtext("notificationMethod"), n.findtext("SoundID")) for n in links] == [
+        ("whiteLampForBody", "whiteLampForBody", None),
+        ("guardsound-1", "guardsound", "1"),
+    ]
+
+
+async def test_set_siren_on_event_off_removes_only_the_guard_sound(camera, client):
+    linked = VMD_TRIGGER.replace(
+        "</EventTriggerNotificationList>",
+        "<EventTriggerNotification><id>guardsound-2</id><notificationMethod>guardsound"
+        "</notificationMethod><SoundID>2</SoundID></EventTriggerNotification>"
+        "</EventTriggerNotificationList>",
+    )
+    camera.serve("GET", VMD, linked)
+    camera.serve("PUT", VMD, WRITE_OK)
+
+    await client.set_siren_on_event(False)
+
+    links = put_body(camera, VMD).findall("EventTriggerNotificationList/EventTriggerNotification")
+    assert [n.findtext("id") for n in links] == ["whiteLampForBody"]
+
+
+async def test_set_siren_on_event_adds_a_missing_link_list(camera, client):
+    camera.serve("GET", VMD, "<EventTrigger><id>VMD</id></EventTrigger>")
+    camera.serve("PUT", VMD, WRITE_OK)
+
+    await client.set_siren_on_event(True)
+
+    links = put_body(camera, VMD).findall("EventTriggerNotificationList/EventTriggerNotification")
+    assert [n.findtext("id") for n in links] == ["guardsound-1"]
+
+
+async def test_volume_reads_output_volume(camera, client):
+    camera.serve("GET", AUDIO, TWO_WAY_AUDIO)
+    assert await client.get_volume() == 80
+
+
+async def test_set_volume_writes_the_whole_document_without_options(camera, client):
+    camera.serve("GET", AUDIO, TWO_WAY_AUDIO)
+    camera.serve("PUT", AUDIO, WRITE_OK)
+
+    await client.set_volume(30)
+
+    body = put_body(camera, AUDIO)
+    assert body.findtext("outputVolume") == "30"
+    assert body.findtext("speakerVolume") == "80"
+    assert all("opt" not in node.attrib for node in body.iter())
+
+
+async def test_volume_without_output_volume_raises_protocol_error(camera, client):
+    camera.serve("GET", AUDIO, "<TwoWayAudioChannel><id>1</id></TwoWayAudioChannel>")
+    with pytest.raises(ProtocolError, match="outputVolume"):
+        await client.get_volume()
+
+
+@pytest.mark.parametrize("volume", [-1, 101])
+async def test_set_volume_rejects_out_of_range(client, volume):
+    with pytest.raises(ValueError):
+        await client.set_volume(volume)
+
+
+@pytest.mark.parametrize("level", [-1, 101])
+async def test_set_sensitivity_rejects_out_of_range(client, level):
+    with pytest.raises(ValueError):
+        await client.set_sensitivity(level)
+
+
+async def test_detection_reads_the_sensitivity(camera, client):
+    camera.serve(
+        "GET", DETECTION,
+        "<MotionDetection><enabled>true</enabled><carEnabled>true</carEnabled>"
+        f"<allEnabled>false</allEnabled>{EXTRA_DETECTION}</MotionDetection>",
+    )
+    assert (await client.get_detection()).sensitivity == 60
+
+
+async def test_set_sensitivity_keeps_the_grid(camera, client):
+    camera.serve(
+        "GET", DETECTION,
+        f"<MotionDetection><enabled>true</enabled>{EXTRA_DETECTION}</MotionDetection>",
+    )
+    camera.serve("PUT", DETECTION, WRITE_OK)
+
+    await client.set_sensitivity(90)
+
+    body = put_body(camera, DETECTION)
+    assert body.findtext("MotionDetectionLayout/sensitivityLevel") == "90"
+    assert body.findtext("MotionDetectionLayout/layout/gridMap") == "FFFC00"

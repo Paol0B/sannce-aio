@@ -12,6 +12,7 @@ MAX_PACKET = 2048
 MAX_COMMAND_PAYLOAD = 1440
 MAX_DATA_PAYLOAD = 1448
 TERMINATOR = b"\n\n\n"
+_ROUTES = frozenset({"IP", "PROXY"})
 
 _COMMAND_HEADER = struct.Struct("<IHH10xH")
 _DATA_HEADER = struct.Struct("<II4s2xH4x")
@@ -21,7 +22,7 @@ _DATA_HEADER = struct.Struct("<II4s2xH4x")
 class Frame:
     magic: int
     seq: int
-    fields: list[str] | None = None
+    commands: list[list[str]] | None = None
     payload: bytes | None = None
 
 
@@ -39,23 +40,32 @@ def encode_fields(fields: list[str]) -> bytes:
     return payload
 
 
-def decode_fields(payload: bytes) -> list[str]:
+def decode_commands(payload: bytes) -> list[list[str]]:
     if not payload:
         return []
-    end = payload.find(TERMINATOR)
-    if end < 0:
+    *pieces, _unterminated = payload.split(TERMINATOR)
+    if not pieces:
         raise ProtocolError("payload has no terminator")
-    if end != len(payload) - len(TERMINATOR):
-        raise ProtocolError("payload holds more than one command")
-    try:
-        text = payload[:end].decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ProtocolError(f"payload is not UTF-8: {exc}") from exc
-    return text.split("\t")
+    commands: list[list[str]] = []
+    for piece in pieces:
+        if not piece:
+            continue
+        try:
+            fields = piece.decode("utf-8").split("\t")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(f"payload is not UTF-8: {exc}") from exc
+        # later commands omit the device ip and route (protocol.md, Delimiting messages)
+        if commands and not (len(fields) > 1 and fields[1] in _ROUTES):
+            fields = [*commands[0][:2], *fields]
+        commands.append(fields)
+    return commands
 
 
 def build_command(fields: list[str], seq: int) -> bytes:
-    payload = encode_fields(fields)
+    return pack_command(encode_fields(fields), seq)
+
+
+def pack_command(payload: bytes, seq: int) -> bytes:
     _check_size(payload, MAX_COMMAND_PAYLOAD)
     header = _COMMAND_HEADER.pack(
         COMMAND_MAGIC, seq, HEADER_SIZE + len(payload), len(payload)
@@ -82,9 +92,9 @@ def parse_frame(buf: bytes) -> tuple[Frame | None, int]:
             # the SDK ignores offset 18 on receive (protocol.md, Packet header)
             body = bytes(buf[start + HEADER_SIZE : end])
             if magic == COMMAND_MAGIC:
-                return Frame(magic, seq, fields=decode_fields(body)), end
+                return Frame(magic, seq, commands=decode_commands(body)), end
             return Frame(magic, seq, payload=body), end
-        # resync: skip one byte (protocol.md, Delimiting messages in a TCP stream)
+        # resync: skip one byte (protocol.md, Delimiting messages)
         start += 1
     return None, 0
 

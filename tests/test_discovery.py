@@ -161,7 +161,7 @@ def test_missing_trailing_fields_read_as_empty(reply_fields):
 
     assert camera == DiscoveredCamera(
         ip="192.168.1.5",
-        mac="00:00:5E:00:53:2A",
+        mac="00:00:5e:00:53:2a",
         serial="",
         model="",
         http_port=80,
