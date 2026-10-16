@@ -389,6 +389,64 @@ async def test_a_camera_hangup_mid_play_raises_and_the_next_play_reopens(rtsp, s
     assert len(authorized(rtsp, "SETUP")) == 2
 
 
+def lingering_speaker(rtsp):
+    made = []
+
+    def open_channel():
+        made.append(Backchannel(rtsp.host, rtsp.port, "/1/1", "admin", "admin123", timeout=2.0))
+        return made[-1]
+
+    return Speaker(open_channel, linger=30, hangover=TEST_HANGOVER), made
+
+
+async def hang_up_while_lingering(rtsp):
+    speaker, made = lingering_speaker(rtsp)
+    assert await speaker.play(chunks(tone(1))) is True
+    rtsp.hang_up()
+    await until(lambda: made[0].closed)
+    return speaker
+
+
+async def test_a_play_reopens_a_lingering_session_the_camera_closed(rtsp):
+    speaker = await hang_up_while_lingering(rtsp)
+    try:
+        assert await speaker.play(chunks(tone(5, NEWER))) is True
+
+        await until(lambda: payloads(rtsp).count(sound(NEWER)) == 5)
+        assert len(authorized(rtsp, "SETUP")) == 2
+    finally:
+        await speaker.close()
+
+
+async def test_a_talk_reopens_a_lingering_session_the_camera_closed(rtsp, caplog):
+    speaker = await hang_up_while_lingering(rtsp)
+    try:
+        await say_until(speaker, lambda: encode_alaw(voice()) in payloads(rtsp), (SSRC, voice()))
+
+        assert speaker_warnings(caplog) == []
+        assert len(authorized(rtsp, "SETUP")) == 2
+    finally:
+        await speaker.close()
+
+
+async def test_a_returning_talk_reopens_its_lingering_session_the_camera_closed(rtsp, caplog):
+    speaker, made = lingering_speaker(rtsp)
+    try:
+        await say_until(speaker, lambda: rtsp.packets, (SSRC, voice()))
+        await say_until(speaker, lambda: speaker.owner is None, (SSRC, quiet()))
+        rtsp.hang_up()
+        await say_until(speaker, lambda: made[0].closed, (SSRC, quiet()))
+
+        await say_until(
+            speaker, lambda: encode_alaw(voice(2000)) in payloads(rtsp), (SSRC, voice(2000))
+        )
+
+        assert speaker_warnings(caplog) == []
+        assert len(authorized(rtsp, "SETUP")) == 2
+    finally:
+        await speaker.close()
+
+
 async def test_cancelling_a_play_frees_the_speaker(rtsp, speaker):
     playing = asyncio.create_task(speaker.play(Producer()))
     await until(lambda: rtsp.packets)

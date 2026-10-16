@@ -58,6 +58,10 @@ class Backchannel:
         self._due = 0.0
         self._last_keepalive = 0.0
 
+    @property
+    def closed(self) -> bool:
+        return self._drain is None or self._drain.done()
+
     async def has_backchannel(self) -> bool:
         await self._connect()
         try:

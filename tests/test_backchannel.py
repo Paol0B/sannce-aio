@@ -268,6 +268,21 @@ async def test_stream_raises_connect_error_when_the_camera_hangs_up(rtsp):
     await asyncio.wait_for(bc.close(), 2)
 
 
+async def test_closed_follows_the_camera_connection(rtsp):
+    bc = channel(rtsp)
+    assert bc.closed
+    await bc.open()
+    assert not bc.closed
+
+    rtsp.hang_up()
+
+    async with asyncio.timeout(2):
+        while not bc.closed:
+            await asyncio.sleep(0.01)
+    await bc.close()
+    assert bc.closed
+
+
 async def test_stream_raises_connect_error_when_the_camera_stops_reading(stalled):
     bc = Backchannel(stalled.host, stalled.port, "/1/1", "admin", "admin123", timeout=0.5)
     await bc.open()

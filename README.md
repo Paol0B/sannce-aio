@@ -190,7 +190,7 @@ A talk is one SSRC, that is one client. The speaker keeps the state of each SSRC
 - A talk ends 1.0 to 1.25 s after its last voice frame, whether silent frames or no frames follow. The speaker checks every `HANGOVER / 4`. The end frees the speaker at once.
 - A talk that owns the speaker sends all its frames, silent ones too, so speech is not cut.
 - A talk that lost the speaker stays muted while its voice continues. It takes the speaker again on its next start, or when the speaker is free while it still has voice.
-- The speaker opens the camera session on first need. It keeps the session for 3.0 s (`LINGER`) after the speaker is freed. So the next sound starts without a new `DESCRIBE`, `SETUP` and `PLAY`. A new owner reuses the open session.
+- The speaker opens the camera session on first need. It keeps the session for 3.0 s (`LINGER`) after the speaker is freed. So the next sound starts without a new `DESCRIBE`, `SETUP` and `PLAY`. A new owner reuses the open session. If the camera has closed it, the new owner opens a new one.
 - Talk frames that arrive while the session opens wait in a queue of at most 1.0 s (`TALK_BUFFER`). The speaker drops older frames, so a slow camera adds no lasting delay.
 - When the camera session cannot open or breaks during a talk, the speaker drops the frames of that talk. It logs one warning for each run of failures. The talk can start again at its next start.
 - A play that loses the speaker ends with a debug log line only.

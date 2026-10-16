@@ -22,6 +22,7 @@ _log = logging.getLogger(__name__)
 class _Source:
     kind: ClassVar[Owner]
     preempted = False
+    channel: Backchannel | None = None
 
 
 class _Play(_Source):
@@ -183,6 +184,11 @@ class Speaker:
         async with self._session_lock:
             if self._owner is not source:
                 return None
+            current = self._channel
+            # reopen a session the camera closed; a break under the source that
+            # writes on it must raise from that write instead
+            if current is not None and current is not source.channel and current.closed:
+                await self._close_channel()
             if self._channel is None:
                 channel = self._open_channel()
                 opening = self._opening = asyncio.create_task(channel.open())
@@ -209,6 +215,7 @@ class Speaker:
                     self._opening = None
                 self._channel = channel
                 self._failing = False
+            source.channel = self._channel
             return self._channel
 
     def _superseded(self, source: _Source) -> bool:
@@ -264,6 +271,7 @@ class Speaker:
         if isinstance(previous, _Talk):
             previous.drop()
         source.preempted = False
+        source.channel = None
         self._set_owner(source)
 
     def _free(self, source: _Source) -> None:
