@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import math
+import struct
+from collections import deque
 from collections.abc import AsyncIterable, Callable
 from typing import ClassVar, Literal
 
-from .backchannel import FRAME_BYTES, Backchannel
+from .backchannel import FRAME_BYTES, SAMPLE_RATE, Backchannel
 from .errors import ConnectError, SannceError
 
 LINGER = 3.0
@@ -11,6 +14,7 @@ HANGOVER = 1.0
 TALK_BUFFER = 1.0
 VOICE_LEVEL = 16
 Owner = Literal["talk", "play"]
+_FRAME_SECONDS = FRAME_BYTES / 2 / SAMPLE_RATE
 
 _log = logging.getLogger(__name__)
 
@@ -21,6 +25,27 @@ class _Source:
 
 class _Play(_Source):
     kind = "play"
+
+
+class _Talk(_Source):
+    kind = "talk"
+
+    def __init__(self, frames: int) -> None:
+        self.queue: deque[bytes] = deque(maxlen=frames)
+        self.pending = bytearray()
+        self.last_frame = 0.0
+        self.last_voice = -math.inf
+        self.muted = False
+
+    def push(self, pcm: bytes) -> None:
+        self.pending += pcm
+        while len(self.pending) >= FRAME_BYTES:
+            self.queue.append(bytes(self.pending[:FRAME_BYTES]))
+            del self.pending[:FRAME_BYTES]
+
+    def drop(self) -> None:
+        self.queue.clear()
+        self.pending.clear()
 
 
 class Speaker:
@@ -35,7 +60,7 @@ class Speaker:
         self._open_channel = open_channel
         self._linger = linger
         self._hangover = hangover
-        self._talk_buffer = talk_buffer
+        self._talk_frames = max(1, round(talk_buffer / _FRAME_SECONDS))
         self._owner: _Source | None = None
         self._subscribers: dict[object, Callable[[Owner | None], None]] = {}
         self._channel: Backchannel | None = None
@@ -44,6 +69,11 @@ class Speaker:
         self._write_lock = asyncio.Lock()
         self._expiry: asyncio.TimerHandle | None = None
         self._closers: set[asyncio.Task[None]] = set()
+        self._talks: dict[int, _Talk] = {}
+        self._talk_check: asyncio.TimerHandle | None = None
+        self._pump: asyncio.Task[None] | None = None
+        self._wake = asyncio.Event()
+        self._failing = False
         self._closed = False
 
     @property
@@ -69,13 +99,41 @@ class Speaker:
         finally:
             self._free(source)
 
+    def feed_talk(self, ssrc: int, pcm: bytes) -> None:
+        if self._closed or len(pcm) % 2:
+            return
+        now = asyncio.get_running_loop().time()
+        talk = self._talks.get(ssrc)
+        if talk is None:
+            talk = self._talks[ssrc] = _Talk(self._talk_frames)
+            if self._talk_check is None:
+                self._schedule_talk_check()
+        talk.last_frame = now
+        if _is_voice(pcm):
+            started = now - talk.last_voice >= self._hangover
+            talk.last_voice = now
+            if self._owner is not talk and (started or (talk.muted and self._owner is None)):
+                self._take_talk(talk)
+        if self._owner is talk:
+            talk.push(pcm)
+            self._wake.set()
+
     async def close(self) -> None:
         self._closed = True
         self._cancel_expiry()
+        if self._talk_check is not None:
+            self._talk_check.cancel()
+            self._talk_check = None
+        self._talks.clear()
         if self._owner is not None:
             self._set_owner(None)
         if self._opening is not None:
             self._opening.cancel()
+        pump, self._pump = self._pump, None
+        if pump is not None:
+            # the pump can hold the write lock in a stalled write
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
         async with self._write_lock, self._session_lock:
             await self._close_channel()
         closers = list(self._closers)
@@ -146,12 +204,59 @@ class Speaker:
                 finally:
                     self._opening = None
                 self._channel = channel
+                self._failing = False
             return self._channel
+
+    def _take_talk(self, talk: _Talk) -> None:
+        talk.muted = False
+        self._take(talk)
+        if self._pump is None or self._pump.done():
+            self._pump = asyncio.create_task(self._pump_talk())
+
+    async def _pump_talk(self) -> None:
+        while isinstance(talk := self._owner, _Talk):
+            if not talk.queue:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            try:
+                await self._send(talk, talk.queue.popleft())
+            except SannceError as exc:
+                if self._failing:
+                    _log.debug("talk still cannot reach the camera: %s", exc)
+                else:
+                    self._failing = True
+                    _log.warning("talk cannot reach the camera: %s", exc)
+                self._end_talk(talk)
+
+    def _end_talk(self, talk: _Talk) -> None:
+        talk.drop()
+        self._free(talk)
+
+    def _schedule_talk_check(self) -> None:
+        self._talk_check = asyncio.get_running_loop().call_later(
+            self._hangover / 4, self._check_talks
+        )
+
+    def _check_talks(self) -> None:
+        now = asyncio.get_running_loop().time()
+        for ssrc, talk in list(self._talks.items()):
+            if talk is self._owner and now - talk.last_voice >= self._hangover:
+                self._end_talk(talk)
+            if now - talk.last_frame >= self._hangover:
+                del self._talks[ssrc]
+        self._talk_check = None
+        if self._talks:
+            self._schedule_talk_check()
 
     def _take(self, source: _Source) -> None:
         self._cancel_expiry()
-        if self._owner is not None:
-            _log.debug("a %s took the speaker from a %s", source.kind, self._owner.kind)
+        previous = self._owner
+        if previous is not None:
+            _log.debug("a %s took the speaker from a %s", source.kind, previous.kind)
+        if isinstance(previous, _Talk):
+            previous.muted = True
+            previous.drop()
         self._set_owner(source)
 
     def _free(self, source: _Source) -> None:
@@ -162,6 +267,7 @@ class Speaker:
 
     def _set_owner(self, source: _Source | None) -> None:
         self._owner = source
+        self._wake.set()
         kind = self.owner
         for callback in list(self._subscribers.values()):
             try:
@@ -189,3 +295,8 @@ class Speaker:
         channel, self._channel = self._channel, None
         if channel is not None:
             await channel.close()
+
+
+def _is_voice(pcm: bytes) -> bool:
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    return max(samples, default=0) > VOICE_LEVEL or min(samples, default=0) < -VOICE_LEVEL
