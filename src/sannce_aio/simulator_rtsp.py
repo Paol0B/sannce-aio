@@ -58,14 +58,14 @@ class RtspFront:
         self.password = password
         self._start_password = password
         self.busy = False
-        self._speakers = 0
+        self._sessions: list[_Client] = []
         self._audio: list[bytes] = []
         self._server: asyncio.Server | None = None
         self._clients: set[asyncio.Task[None]] = set()
 
     @property
     def speaking(self) -> bool:
-        return self._speakers > 0
+        return bool(self._sessions)
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle, self.host, self.port)
@@ -104,15 +104,25 @@ class RtspFront:
         finally:
             self._clients.discard(task)
 
-    def _start_speaking(self) -> None:
-        self._speakers += 1
-        self._audio = []
+    @property
+    def _owner(self) -> "_Client | None":
+        return self._sessions[0] if self._sessions else None
 
-    def _stop_speaking(self) -> None:
-        self._speakers -= 1
+    def _start_speaking(self, client: "_Client") -> None:
+        if client in self._sessions:
+            return
+        self._sessions.append(client)
+        if len(self._sessions) == 1:
+            self._audio = []
 
-    def _record(self, packet: bytes) -> None:
-        if len(packet) <= _RTP_HEADER:
+    def _stop_speaking(self, client: "_Client") -> None:
+        was_owner = client is self._owner
+        self._sessions.remove(client)
+        if was_owner and self._sessions:
+            self._audio = []
+
+    def _record(self, client: "_Client", packet: bytes) -> None:
+        if client is not self._owner or len(packet) <= _RTP_HEADER:
             return
         decode = _DECODERS.get(packet[1] & 0x7F)
         if decode is None:
@@ -154,7 +164,7 @@ class _Client:
                     channel, length = struct.unpack("!BH", await self.reader.readexactly(3))
                     packet = await self.reader.readexactly(length)
                     if channel == self.channel:
-                        self.front._record(packet)
+                        self.front._record(self, packet)
                     continue
                 head = first + await self.reader.readuntil(b"\r\n\r\n")
                 method, url, headers = _parse_request(head)
@@ -231,7 +241,7 @@ class _Client:
         if match is None:
             await self._reply(cseq, "461 Unsupported Transport", {})
             return
-        self.front._start_speaking()
+        self.front._start_speaking(self)
         self.channel = int(match.group(1))
         self.tracks.add(_track(url))
         await self._reply(cseq, "200 OK", {"Transport": transport, "Session": self.session})
@@ -348,7 +358,7 @@ class _Client:
     async def _close(self) -> None:
         if self.channel is not None:
             self.channel = None
-            self.front._stop_speaking()
+            self.front._stop_speaking(self)
         if self.relay is not None:
             self.relay.cancel()
             await asyncio.gather(self.relay, return_exceptions=True)

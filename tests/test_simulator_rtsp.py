@@ -8,6 +8,7 @@ import struct
 import pytest
 import pytest_asyncio
 
+from sannce_aio.audio import decode_alaw, encode_alaw
 from sannce_aio.backchannel import FRAME_BYTES, Backchannel
 from sannce_aio.errors import AuthError, ProtocolError, TalkBusyError
 from sannce_aio.simulator_rtsp import RtspFront
@@ -289,3 +290,132 @@ async def test_the_describe_reply_uses_the_host_of_the_request(front):
     assert f"Content-Base: {base}/\r\n" in head
     assert f"a=control:{base}/trackID=1" in client.body
     assert f"a=control:{base}/trackID=bc" in client.body
+
+
+def heard(tone, frames):
+    return decode_alaw(encode_alaw(struct.pack("<h", tone) * 160)) * frames
+
+
+async def until(predicate):
+    async with asyncio.timeout(2):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
+async def join(front):
+    client = await RawClient.connect(front.port)
+    setup = await client.request("SETUP", "/trackID=bc", BACKCHANNEL_TRANSPORT)
+    assert setup.startswith("RTSP/1.0 200")
+    await client.request("PLAY")
+    return client
+
+
+async def say(client, tone, frames=3):
+    packet = struct.pack("!BBHII", 0x80, 8, 0, 0, 1) + encode_alaw(
+        struct.pack("<h", tone) * 160
+    )
+    for _ in range(frames):
+        client.writer.write(struct.pack("!cBH", b"$", 4, len(packet)) + packet)
+    await client.request("GET_PARAMETER")
+
+
+async def teardown(client):
+    await client.request("TEARDOWN")
+    await client.until_closed()
+
+
+async def test_a_second_backchannel_session_is_not_recorded(front):
+    first, second = await join(front), await join(front)
+    try:
+        await say(first, 1000)
+        await say(second, 2000)
+    finally:
+        first.close()
+        second.close()
+
+    assert front.wav()[44:] == heard(1000, 3)
+
+
+@pytest.mark.parametrize("leave", ["teardown", "drop"])
+async def test_the_next_session_owns_the_speaker_after_the_owner_leaves(front, leave):
+    first, second = await join(front), await join(front)
+    try:
+        await say(first, 1000)
+        await say(second, 2000)
+        if leave == "teardown":
+            await teardown(first)
+        else:
+            first.close()
+            await until(lambda: front.wav()[44:] == b"")
+
+        assert front.speaking is True
+        assert front.wav()[44:] == b""
+        await say(second, 2000, frames=2)
+        assert front.wav()[44:] == heard(2000, 2)
+    finally:
+        second.close()
+
+    await until(lambda: not front.speaking)
+    assert front.wav()[44:] == heard(2000, 2)
+
+
+async def test_the_oldest_waiting_session_takes_over_first(front):
+    clients = [await join(front) for _ in range(3)]
+    try:
+        await teardown(clients[0])
+        await say(clients[2], 3000)
+        await say(clients[1], 2000)
+    finally:
+        for client in clients:
+            client.close()
+
+    assert front.wav()[44:] == heard(2000, 3)
+
+
+async def test_a_waiting_session_leaving_keeps_the_owner_recording(front):
+    first, second = await join(front), await join(front)
+    try:
+        await say(first, 1000)
+        await teardown(second)
+        assert front.speaking is True
+        await say(first, 1000)
+    finally:
+        first.close()
+
+    assert front.wav()[44:] == heard(1000, 6)
+
+
+async def test_reset_keeps_the_owner_and_clears_the_recording(front):
+    first, second = await join(front), await join(front)
+    try:
+        await say(first, 1000)
+        front.reset()
+        assert front.speaking is True
+        assert front.wav()[44:] == b""
+        await say(second, 2000)
+        await say(first, 1000, frames=1)
+    finally:
+        first.close()
+        second.close()
+
+    assert front.wav()[44:] == heard(1000, 1)
+
+
+async def test_a_connection_that_sets_up_twice_is_one_session(front):
+    client = await join(front)
+    client.base = client.base.replace("/1/1", "/1/2")
+    setup = await client.request("SETUP", "/trackID=bc", BACKCHANNEL_TRANSPORT)
+    assert setup.startswith("RTSP/1.0 200")
+    await teardown(client)
+
+    assert front.speaking is False
+
+
+async def test_stopping_the_front_ends_every_session(upstream):
+    async with serve(upstream.port) as proxy:
+        clients = [await join(proxy) for _ in range(2)]
+        assert proxy.speaking is True
+
+    assert proxy.speaking is False
+    for client in clients:
+        client.close()
