@@ -26,6 +26,7 @@ PUBLIC_NAMES = {
     "RtspRelay",
     "SannceCamera",
     "SannceError",
+    "Speaker",
     "TalkBusyError",
     "discover",
     "find_camera",

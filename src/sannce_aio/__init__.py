@@ -10,6 +10,7 @@ from .errors import (
 from .events import Event
 from .http import Detection
 from .relay import RtspRelay
+from .speaker import Speaker
 
 __all__ = [
     "AuthError",
@@ -23,6 +24,7 @@ __all__ = [
     "RtspRelay",
     "SannceCamera",
     "SannceError",
+    "Speaker",
     "TalkBusyError",
     "discover",
     "find_camera",

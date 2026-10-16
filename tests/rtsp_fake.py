@@ -23,6 +23,7 @@ class FakeRtspCamera:
         qop=False,
         auth=True,
         stall_after_play=False,
+        setup_gate=None,
     ):
         self.username = username
         self.password = password
@@ -32,6 +33,7 @@ class FakeRtspCamera:
         self.qop = qop
         self.auth = auth
         self.stall_after_play = stall_after_play
+        self.setup_gate = setup_gate
         self.host = "127.0.0.1"
         self.port = 0
         self.requests = []
@@ -49,10 +51,15 @@ class FakeRtspCamera:
         self.port = self._server.sockets[0].getsockname()[1]
 
     async def stop(self):
+        if self.setup_gate is not None:
+            self.setup_gate.set()
         self._server.close()
+        self.hang_up()
+        await self._server.wait_closed()
+
+    def hang_up(self):
         for writer in list(self._writers):
             writer.close()
-        await self._server.wait_closed()
 
     def sdp(self, url):
         lines = [
@@ -101,6 +108,8 @@ class FakeRtspCamera:
                     for name, value in (line.split(": ", 1) for line in lines)
                 }
                 self.requests.append((method, url, headers))
+                if method == "SETUP" and self.setup_gate is not None:
+                    await self.setup_gate.wait()
                 writer.write(self._reply(method, url, headers).encode())
                 await writer.drain()
                 if method == "PLAY" and self.stall_after_play:

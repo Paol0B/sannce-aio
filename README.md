@@ -166,6 +166,10 @@ It raises `TalkBusyError` if the camera refuses the audio channel with a busy st
 
 `play_audio` sends audio to the camera and does not receive any. The camera does not play audio sent over the WebSocket.
 
+### Speaker
+
+A `Speaker` holds at most one backchannel session to the camera, because the camera plays only the first open one. The newest start owns the speaker. `await play(pcm)` takes the same PCM as `play_audio`. It returns `True` when the PCM ran out, and `False` when a newer play took over or the speaker closed. `owner` is `"play"` while a play runs, else `None`. `subscribe(callback)` calls back with the new owner on every change and returns a function that unsubscribes. The session stays open for 3 s after the speaker is freed, so the next play reuses it. `await close()` ends every play and the session.
+
 ### RTSP relay
 
 ```python
