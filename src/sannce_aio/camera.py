@@ -14,6 +14,7 @@ from .errors import AuthError, ConnectError, SannceError
 from .events import Event
 from .http import Detection, HttpClient
 from .login import SaltedLogin
+from .speaker import Speaker
 
 _log = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class SannceCamera:
         self._event_timers: dict[tuple[str, int], asyncio.TimerHandle] = {}
         self._info = CameraInfo()
         self._caps: frozenset[str] = frozenset()
-        self._play_lock = asyncio.Lock()
+        self._speaker = Speaker(self._backchannel)
         self._sound_count = 0
 
     @property
@@ -89,6 +90,10 @@ class SannceCamera:
     def sound_count(self) -> int:
         return self._sound_count
 
+    @property
+    def speaker(self) -> Speaker:
+        return self._speaker
+
     async def connect(self) -> None:
         try:
             features = await self._http.get_capabilities()
@@ -102,6 +107,7 @@ class SannceCamera:
             raise
 
     async def close(self) -> None:
+        await self._speaker.close()
         for timer in self._event_timers.values():
             timer.cancel()
         self._event_timers.clear()
@@ -205,14 +211,8 @@ class SannceCamera:
     async def set_siren_on_event(self, on: bool) -> None:
         await self._http.set_siren_on_event(on)
 
-    async def play_audio(self, pcm: AsyncIterable[bytes]) -> None:
-        async with self._play_lock:
-            channel = self._backchannel()
-            await channel.open()
-            try:
-                await channel.stream(pcm)
-            finally:
-                await channel.close()
+    async def play_audio(self, pcm: AsyncIterable[bytes]) -> bool:
+        return await self._speaker.play(pcm)
 
     def _backchannel(self) -> Backchannel:
         return Backchannel(

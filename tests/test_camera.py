@@ -61,6 +61,10 @@ def track_closed_sessions(monkeypatch):
     return closed
 
 
+def authorized_setups(rtsp):
+    return [m for m, _, h in rtsp.requests if m == "SETUP" and "authorization" in h]
+
+
 @pytest_asyncio.fixture
 async def rtsp():
     camera = FakeRtspCamera(username=USER, password=PASSWORD)
@@ -535,9 +539,10 @@ async def test_on_login_failed_reports_a_refused_reconnect(simulator, make_camer
 
 async def test_play_audio_streams_through_the_backchannel(make_camera, rtsp):
     camera = await make_camera()
-    await camera.play_audio(async_iter([b"\x01\x00" * 160, b"\x01\x00" * 100]))
+    played = await camera.play_audio(async_iter([b"\x01\x00" * 160, b"\x01\x00" * 100]))
 
-    await wait_until(lambda: rtsp.requests[-1][0] == "TEARDOWN")
+    assert played is True
+    await wait_until(lambda: len(rtsp.packets) == 2)
     assert [ch for ch, _ in rtsp.packets] == [4, 4]
 
 
@@ -557,7 +562,7 @@ async def test_play_audio_tears_down_on_producer_error(make_camera, rtsp):
 
     with pytest.raises(RuntimeError):
         await camera.play_audio(failing())
-    await asyncio.sleep(0.05)
+    await camera.close()
     assert rtsp.requests[-1][0] == "TEARDOWN"
 
 
@@ -577,12 +582,14 @@ async def test_cancelling_play_audio_tears_down_and_frees_the_speaker(make_camer
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5.0)
 
-    await wait_until(lambda: rtsp.requests[-1][0] == "TEARDOWN")
+    await wait_until(lambda: camera.speaker.owner is None)
     await asyncio.wait_for(camera.play_audio(async_iter([b"\x00" * 320])), 5.0)
-    assert len(rtsp.packets) == 2
+    await wait_until(lambda: len(rtsp.packets) == 2)
+    assert len(authorized_setups(rtsp)) == 1
+    assert camera.speaker.owner is None
 
 
-async def test_overlapping_play_audio_calls_run_one_after_the_other(make_camera, rtsp):
+async def test_a_newer_play_audio_preempts_the_running_one(make_camera, rtsp):
     camera = await make_camera()
     streaming = asyncio.Event()
     release = asyncio.Event()
@@ -593,19 +600,35 @@ async def test_overlapping_play_audio_calls_run_one_after_the_other(make_camera,
         await release.wait()
         yield b"\x00" * 320
 
-    def setups():
-        return [m for m, _, h in rtsp.requests if m == "SETUP" and "authorization" in h]
-
     first = asyncio.create_task(camera.play_audio(held()))
     await asyncio.wait_for(streaming.wait(), 5.0)
     second = asyncio.create_task(camera.play_audio(async_iter([b"\x00" * 320])))
-    await asyncio.sleep(0.2)
-    assert len(setups()) == 1
-    assert not second.done()
+    assert await asyncio.wait_for(second, 5.0) is True
 
     release.set()
-    await asyncio.wait_for(asyncio.gather(first, second), 5.0)
-    assert len(setups()) == 2
+    assert await asyncio.wait_for(first, 5.0) is False
+    assert len(authorized_setups(rtsp)) == 1
+
+
+async def test_close_closes_the_speaker(make_camera, rtsp):
+    camera = await make_camera()
+    streaming = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held():
+        yield b"\x00" * 320
+        streaming.set()
+        await release.wait()
+        yield b"\x00" * 320
+
+    task = asyncio.create_task(camera.play_audio(held()))
+    await asyncio.wait_for(streaming.wait(), 5.0)
+    await camera.close()
+
+    release.set()
+    assert await asyncio.wait_for(task, 5.0) is False
+    assert camera.speaker.owner is None
+    assert rtsp.requests[-1][0] == "TEARDOWN"
 
 
 async def test_a_camera_without_a_backchannel_has_no_speaker_cap(simulator):
