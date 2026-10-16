@@ -125,14 +125,15 @@ class Backchannel:
             await self.send(bytes(buffer) + bytes(FRAME_BYTES - len(buffer)))
 
     async def close(self) -> None:
-        if self._writer is not None and self._session is not None:
-            try:
+        try:
+            if self._writer is not None and self._session is not None:
                 await self._write(
                     self._request_bytes("TEARDOWN", self._url, {}), _CLOSE_SECONDS
                 )
-            except ConnectError:
-                pass
-        await self._abort()
+        except ConnectError:
+            pass
+        finally:
+            await self._abort()
 
     async def _connect(self) -> None:
         self._challenge = None

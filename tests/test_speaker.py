@@ -47,6 +47,47 @@ class Producer:
         return tone(1)
 
 
+class StubChannel:
+    def __init__(self, hold=None, error=None):
+        self.hold = hold
+        self.error = error
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+        self.frames = 0
+        self.closed = False
+
+    async def open(self):
+        await self._pass("open")
+
+    async def send(self, frame):
+        if self.closed:
+            raise ConnectError("the backchannel is not open")
+        await self._pass("send")
+        self.frames += 1
+
+    async def close(self):
+        self.closed = True
+
+    async def _pass(self, call):
+        if call != self.hold:
+            return
+        self.hold = None
+        self.held.set()
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+
+
+def stub_speaker(first):
+    made = []
+
+    def open_channel():
+        made.append(first if not made else StubChannel())
+        return made[-1]
+
+    return Speaker(open_channel, linger=TEST_LINGER), made
+
+
 async def until(condition, timeout=2.0):
     async with asyncio.timeout(timeout):
         while not condition():
@@ -193,6 +234,76 @@ async def test_a_play_started_while_another_opens_the_session_reuses_it():
         await until(lambda: len(rtsp.packets) == 2)
         assert payloads(rtsp) == [sound(NEWER)] * 2
         assert len(authorized(rtsp, "SETUP")) == 1
+
+
+async def test_a_preempted_play_ends_quietly_when_its_open_fails():
+    broken = StubChannel(hold="open", error=TalkBusyError("busy"))
+    speaker, made = stub_speaker(broken)
+    owners = []
+    speaker.subscribe(owners.append)
+    first = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await asyncio.wait_for(broken.held.wait(), 1)
+    second = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await until(lambda: owners.count("play") == 2)
+
+    broken.release.set()
+
+    assert await asyncio.wait_for(first, 1) is False
+    assert await asyncio.wait_for(second, 1) is True
+    assert made[1].frames == 1
+    await speaker.close()
+
+
+async def test_a_preempted_play_ends_quietly_when_its_last_write_fails():
+    broken = StubChannel(hold="send", error=ConnectError("hung up"))
+    speaker, _ = stub_speaker(broken)
+    first = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await asyncio.wait_for(broken.held.wait(), 1)
+    newer = Producer(hold_at=1)
+    second = asyncio.create_task(speaker.play(newer))
+    await asyncio.wait_for(newer.held.wait(), 1)
+
+    broken.release.set()
+
+    assert await asyncio.wait_for(first, 1) is False
+    assert broken.closed
+    await speaker.close()
+    newer.release.set()
+    assert await asyncio.wait_for(second, 1) is False
+
+
+async def test_a_new_owner_opens_its_own_session_when_the_old_owner_broke_it():
+    broken = StubChannel(hold="send", error=ConnectError("hung up"))
+    speaker, made = stub_speaker(broken)
+    owners = []
+    speaker.subscribe(owners.append)
+    first = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await asyncio.wait_for(broken.held.wait(), 1)
+    second = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await until(lambda: owners.count("play") == 2)
+
+    broken.release.set()
+
+    assert await asyncio.wait_for(first, 1) is False
+    assert await asyncio.wait_for(second, 1) is True
+    assert len(made) == 2
+    assert made[1].frames == 1
+    await speaker.close()
+
+
+async def test_close_during_a_stalled_write_ends_the_play_with_false():
+    stalled = StubChannel(hold="send", error=ConnectError("the camera took no data"))
+    speaker, _ = stub_speaker(stalled)
+    playing = asyncio.create_task(speaker.play(chunks(tone(1))))
+    await asyncio.wait_for(stalled.held.wait(), 1)
+    closing = asyncio.create_task(speaker.close())
+    await until(lambda: speaker.owner is None)
+
+    stalled.release.set()
+
+    assert await asyncio.wait_for(playing, 1) is False
+    await asyncio.wait_for(closing, 1)
+    assert stalled.closed
 
 
 async def test_a_refused_setup_raises_talk_busy_and_frees_the_speaker():

@@ -303,6 +303,32 @@ async def test_close_gives_up_on_audio_a_stalled_camera_never_takes(stalled):
     await asyncio.wait_for(bc.close(), 3)
 
 
+async def test_cancelling_close_during_teardown_still_drops_the_connection(
+    stalled, monkeypatch
+):
+    monkeypatch.setattr(backchannel, "_CLOSE_SECONDS", 0.2)
+    bc = Backchannel(stalled.host, stalled.port, "/1/1", "admin", "admin123")
+    await bc.open()
+
+    async def until_the_socket_is_full():
+        while not bc._writer.transport.get_write_buffer_size():
+            yield tone(1)
+
+    await asyncio.wait_for(bc.stream(until_the_socket_is_full()), 5)
+    transport = bc._writer.transport
+    transport.set_write_buffer_limits(high=0)
+    closing = asyncio.create_task(bc.close())
+    await asyncio.sleep(0)
+
+    closing.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, 3)
+    assert bc._writer is None
+    assert bc._drain is None
+    assert transport.is_closing()
+
+
 @pytest.mark.parametrize(
     ("reply", "error", "message"),
     [

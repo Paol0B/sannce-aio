@@ -4,7 +4,7 @@ from collections.abc import AsyncIterable, Callable
 from typing import ClassVar, Literal
 
 from .backchannel import FRAME_BYTES, Backchannel
-from .errors import ConnectError
+from .errors import ConnectError, SannceError
 
 LINGER = 3.0
 HANGOVER = 1.0
@@ -98,20 +98,28 @@ class Speaker:
         return True
 
     async def _send(self, source: _Source, frame: bytes) -> bool:
-        channel = await self._session(source)
-        if channel is None:
-            return False
-        async with self._write_lock:
-            if self._owner is not source:
+        while True:
+            channel = await self._session(source)
+            if channel is None:
                 return False
-            try:
-                await channel.send(frame)
-            except ConnectError:
-                async with self._session_lock:
-                    if self._channel is channel:
-                        await self._close_channel()
-                raise
-        return True
+            async with self._write_lock:
+                if self._owner is not source:
+                    return False
+                if self._channel is not channel:
+                    continue
+                try:
+                    await channel.send(frame)
+                except ConnectError as exc:
+                    async with self._session_lock:
+                        if self._channel is channel:
+                            await self._close_channel()
+                    if self._owner is not source:
+                        _log.debug(
+                            "a %s that lost the speaker failed to write: %s", source.kind, exc
+                        )
+                        return False
+                    raise
+                return True
 
     async def _session(self, source: _Source) -> Backchannel | None:
         async with self._session_lock:
@@ -128,6 +136,13 @@ class Speaker:
                     if task is not None and task.cancelling():
                         raise
                     return None
+                except SannceError as exc:
+                    if self._owner is not source:
+                        _log.debug(
+                            "a %s that lost the speaker failed to open: %s", source.kind, exc
+                        )
+                        return None
+                    raise
                 finally:
                     self._opening = None
                 self._channel = channel
