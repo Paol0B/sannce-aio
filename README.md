@@ -14,7 +14,7 @@ Not included: video decoding, ONVIF and multi-channel devices. The library drive
 
 ## Status
 
-Measured on the I91FX by hand (SANNCE I91FX, sold as I91FW, firmware `NVSS_V29.0.23.20250330`, 2026-10-15): the salted WebSocket login, motion and person events, the floodlight, the built-in warning sounds, audio through the RTSP backchannel, and the rule that the camera plays only the first open backchannel session (2026-10-16).
+Measured on the I91FX by hand (SANNCE I91FX, sold as I91FW, firmware `NVSS_V29.0.23.20250330`, 2026-10-15): the salted WebSocket login, motion and person events, the floodlight, the built-in warning sounds, and audio through the RTSP backchannel. On 2026-10-16 the same camera showed that it plays only the first open backchannel session.
 
 The acceptance run with Home Assistant on that camera is done. Still pending on that camera:
 
@@ -161,7 +161,7 @@ asyncio.run(main())
 1. `DESCRIBE` with `Require: www.onvif.org/ver20/backchannel`, answering the Digest login. It picks the `sendonly` audio track, PCMA before PCMU.
 2. `SETUP` with `RTP/AVP/TCP` interleaved, then `PLAY`.
 3. G.711 RTP packets of 20 ms at real-time speed. The packets of one session keep one sequence, timestamp and SSRC. When sending falls more than 0.2 s behind, for example after a pause between two sounds, the clock restarts and no burst follows. On a long stream it sends `GET_PARAMETER` every 30 s.
-4. `TEARDOWN` when the session closes: 3 s after the speaker is freed, or on `close()`.
+4. `TEARDOWN` when the session closes: 3 s after the speaker is freed, or on `close()`. The speaker also sends it, best effort, when a write fails and it drops the session.
 
 `play_audio` returns `True` when the audio ran out. It returns `False` when a newer sound took the speaker, and a play that is preempted raises nothing. A newer `play_audio` call preempts the running one at once: the two calls do not queue. A talk through the relay preempts it too. See Speaker.
 
@@ -177,22 +177,22 @@ The newest start owns the speaker. A play or a talk that starts takes the speake
 
 | Member | What it does |
 |---|---|
-| `await play(pcm)` | Takes the speaker, sends `pcm` as `play_audio` does, then frees the speaker. Returns `True` when the PCM ran out. Returns `False` when a newer start took the speaker, or the speaker closed. It raises `ConnectError`, `ProtocolError`, `AuthError` or `TalkBusyError` when the camera session fails. |
+| `await play(pcm)` | Takes the speaker, sends the PCM as 20 ms G.711 frames as in Audio, then frees the speaker. Returns `True` when the PCM ran out. Returns `False` when a newer start took the speaker, or the speaker closed. It raises `ConnectError`, `ProtocolError`, `AuthError` or `TalkBusyError` when the camera session fails. |
 | `feed_talk(ssrc, pcm)` | Passes PCM16 from the talker with that RTP SSRC. The relay calls it for each RTP packet. It never blocks. |
 | `owner` | `"play"`, `"talk"` or `None`. |
-| `subscribe(callback)` | Calls `callback(owner)` on every change of `owner`, on the event loop. Returns a function that removes the callback. A callback that raises is logged, and the speaker keeps working. |
+| `subscribe(callback)` | Calls `callback(owner)` each time a source takes or frees the speaker, on the event loop. A switch from one play to another, or from one talk to another, calls back with the same value. Returns a function that removes the callback. A callback that raises is logged, and the speaker keeps working. |
 | `await close()` | Ends every play and talk and closes the camera session. `SannceCamera.close()` calls it. |
 
-A talk is one SSRC, that is one client. The speaker keeps the state of each SSRC, so a new relay connection does not give a muted talker a new start. The constants are in `sannce_aio.speaker`.
+A talk is one SSRC, that is one client. The speaker keeps the state of each SSRC, so a new relay connection does not give a muted talker a new start. It drops that state after `HANGOVER` without frames, so a reconnect that takes longer than 1.0 s gives a new start. The constants are in `sannce_aio.speaker`.
 
-- A 20 ms frame is voice when any sample is above 16 in magnitude (`VOICE_LEVEL`). A WebRTC client with a disabled microphone track sends digital silence.
-- A talk starts on a voice frame after at least 1.0 s (`HANGOVER`) without voice, or on the first voice frame of an SSRC the speaker has no state for.
-- A talk ends after `HANGOVER` without voice, or after `HANGOVER` without any frame. The end frees the speaker at once.
+- A frame is the PCM of one `feed_talk` call, normally 20 ms. It is voice when any sample is above 16 in magnitude (`VOICE_LEVEL`). A WebRTC client with a disabled microphone track sends digital silence.
+- A talk starts on a voice frame after at least 1.0 s (`HANGOVER`) without voice. It also starts on the first voice frame of an SSRC the speaker has no state for.
+- A talk ends 1.0 to 1.25 s after its last voice frame, whether silent frames or no frames follow. The speaker checks every `HANGOVER / 4`. The end frees the speaker at once.
 - A talk that owns the speaker sends all its frames, silent ones too, so speech is not cut.
 - A talk that lost the speaker stays muted while its voice continues. It takes the speaker again on its next start, or when the speaker is free while it still has voice.
-- The speaker opens the camera session on first need. It keeps the session for 3.0 s (`LINGER`) after the speaker is freed, so the next sound starts without a new `DESCRIBE`, `SETUP` and `PLAY`. A new owner reuses the open session.
+- The speaker opens the camera session on first need. It keeps the session for 3.0 s (`LINGER`) after the speaker is freed. So the next sound starts without a new `DESCRIBE`, `SETUP` and `PLAY`. A new owner reuses the open session.
 - Talk frames that arrive while the session opens wait in a queue of at most 1.0 s (`TALK_BUFFER`). The speaker drops older frames, so a slow camera adds no lasting delay.
-- When the camera session cannot open or breaks during a talk, the speaker logs one warning for each run of failures and drops the frames of that talk. The talk can start again at its next start.
+- When the camera session cannot open or breaks during a talk, the speaker drops the frames of that talk. It logs one warning for each run of failures. The talk can start again at its next start.
 - A play that loses the speaker ends with a debug log line only.
 
 ### RTSP relay
@@ -207,15 +207,15 @@ url = f"rtsp://admin:PASSWORD@127.0.0.1:{relay.port}/1/2"
 await relay.close()
 ```
 
-`RtspRelay(host, port, *, listen_host="127.0.0.1", timeout=10.0, speaker=None)` listens on a free port of `listen_host`. `port` gives it after `start()`. Each client connection gets its own connection to the camera's RTSP port. Apart from the answers described below, bytes pass both ways unchanged, so the client's URL and Digest login work as they are: the I91FX answers with the host the client put in its request.
+`RtspRelay(host, port, *, listen_host="127.0.0.1", timeout=10.0, speaker=None)` listens on a free port of `listen_host`. `port` gives it after `start()`. Each client connection gets its own connection to the camera's RTSP port. Apart from the answers described below, bytes pass both ways unchanged. So the client's URL and Digest login work as they are, because the I91FX answers with the host the client put in its request.
 
 The I91FX answers a second `SETUP` of the same track in one session with `455 Method Not Valid in This State`. The relay answers that `SETUP` itself, with `200 OK`, the client's `CSeq`, and the `Session` and `Transport` of the camera's first answer. It sends this answer after the camera's answers to earlier requests, and never inside an interleaved frame. The relay matches the camera's answers to requests by `CSeq`. An answer with an unknown `CSeq` passes unchanged and counts for no request. A `TEARDOWN` makes the relay forget the tracks of that connection.
 
 With a `speaker`, the relay also takes the talk of Home Assistant's go2rtc. go2rtc keeps its talk session open after the talk ends. The camera plays only the first open backchannel session, so that session would mute every sound the library sends. For each client connection, the relay:
 
 - Reads the SDP of every `200` answer to `DESCRIBE` and finds the backchannel track, the `sendonly` audio section.
-- Answers every `SETUP` of that track itself and never forwards it. The answer is `200 OK` with the client's `CSeq` and `Transport`, and the camera's session id when the connection already has one. When the connection has no camera session yet, the answer has no `Session` header, and the camera's answer to the next `SETUP` gives go2rtc the real one. The camera never gives the backchannel to go2rtc's session. The answer keeps its place behind the camera's answers to earlier requests.
-- Takes the interleaved channel from that `Transport`. It parses the client's frames on that channel as RTP, decodes PCMU (payload type 0) and PCMA (8) to PCM16 and passes them to `speaker.feed_talk(ssrc, pcm)`. It drops other payload types and logs the first one at debug level.
+- Answers every `SETUP` of that track itself and never forwards it. The answer is `200 OK` with the client's `CSeq` and `Transport`, and the camera's session id when the connection already has one. With no camera session yet, the answer has no `Session` header. The camera's answer to the next `SETUP` gives go2rtc the real one. The camera never gives the backchannel to go2rtc's session. The answer keeps its place behind the camera's answers to earlier requests.
+- Takes the interleaved channel from that `Transport`. It parses the client's frames on that channel as RTP. It decodes PCMU (payload type 0) and PCMA (8) to PCM16 and passes them to `speaker.feed_talk(ssrc, pcm)`. It drops RTP it cannot parse and other payload types, and logs the first drop of a connection at debug level.
 - Never forwards the frames on that channel, or on the next one (RTCP), to the camera.
 
 Without a `speaker`, the relay passes the backchannel `SETUP` and its frames to the camera like any other.
@@ -344,7 +344,7 @@ python -m sannce_aio simulate [--host HOST] [--nvs-port PORT] [--http-port PORT]
 - Defaults: host `0.0.0.0`, WebSocket port 3002, HTTP port 80, control port 8099, user `admin`, password `admin123`, model `I91FW-SIM`, serial `SIM0000000001`, MAC `00:00:5E:00:53:01`.
 - The private protocol runs over a WebSocket on `--nvs-port`, with the salted MD5 login and a new salt for each connection. The simulator sends an idle message every 10 s and repeats an active alarm every second until it stops, as the I91FX does.
 - It answers the LAN search on UDP 3000 and 4000, on every address. It joins both search groups on the interface that `--host` names, or on any interface for `0.0.0.0`. `--model`, `--serial` and `--mac` go into that reply.
-- `--rtsp-port` puts an RTSP front on that port. It asks for the Digest login, as the camera does, and takes TCP interleaved transport only. It relays video and audio from a local RTSP server, such as mediamtx, on `--rtsp-upstream-port` (default 8554). It adds a `sendonly` PCMA and PCMU backchannel track to the `DESCRIBE` reply, and records the audio a client sends on it. As on the I91FX, only the first open backchannel session plays and is recorded, and the others get `200 OK` and have their audio dropped. When the first session ends, the oldest remaining one takes over: that part is an assumption, not tested on the camera. A second `SETUP` of the same track in one session gets `455 Method Not Valid in This State`, and the `Content-Base` and `a=control` URLs use the host of the request. Without `--rtsp-port` there is no RTSP, and `/talk-busy` and `/audio.wav` answer 404.
+- `--rtsp-port` puts an RTSP front on that port. It asks for the Digest login, as the camera does, and takes TCP interleaved transport only. It relays video and audio from a local RTSP server, such as mediamtx, on `--rtsp-upstream-port` (default 8554). It adds a `sendonly` PCMA and PCMU backchannel track to the `DESCRIBE` reply, and records the audio a client sends on it. As on the I91FX, only the first open backchannel session plays and is recorded. The others get `200 OK` and have their audio dropped. When the first session ends, the oldest remaining one takes over. That is an assumption, not tested on the camera. A second `SETUP` of the same track in one session gets `455 Method Not Valid in This State`. The `Content-Base` and `a=control` URLs use the host of the request. Without `--rtsp-port` there is no RTSP, and `/talk-busy` and `/audio.wav` answer 404.
 - Port 80 needs root outside a container. Docker lets any user bind it inside one.
 - It prints one line when it is ready, then runs until Ctrl-C.
 
