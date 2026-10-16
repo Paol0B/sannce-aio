@@ -171,7 +171,7 @@ class Speaker:
                     async with self._session_lock:
                         if self._channel is channel:
                             await self._close_channel()
-                    if self._owner is not source:
+                    if self._superseded(source):
                         _log.debug(
                             "a %s that lost the speaker failed to write: %s", source.kind, exc
                         )
@@ -185,17 +185,20 @@ class Speaker:
                 return None
             if self._channel is None:
                 channel = self._open_channel()
-                self._opening = asyncio.create_task(channel.open())
+                opening = self._opening = asyncio.create_task(channel.open())
                 try:
-                    await self._opening
+                    await opening
                 except asyncio.CancelledError:
+                    # the open may succeed just before our cancel: keep the session, or it leaks
+                    if opening.done() and not opening.cancelled() and opening.exception() is None:
+                        self._channel = channel
                     # close() cancels the open; a cancel of our own task must propagate
                     task = asyncio.current_task()
                     if task is not None and task.cancelling():
                         raise
                     return None
                 except SannceError as exc:
-                    if self._owner is not source:
+                    if self._superseded(source):
                         _log.debug(
                             "a %s that lost the speaker failed to open: %s", source.kind, exc
                         )
@@ -206,6 +209,9 @@ class Speaker:
                 self._channel = channel
                 self._failing = False
             return self._channel
+
+    def _superseded(self, source: _Source) -> bool:
+        return self._closed or (self._owner is not None and self._owner is not source)
 
     def _take_talk(self, talk: _Talk) -> None:
         talk.muted = False

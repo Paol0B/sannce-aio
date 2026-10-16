@@ -96,14 +96,14 @@ class StubChannel:
             raise self.error
 
 
-def stub_speaker(first):
+def stub_speaker(first, **options):
     made = []
 
     def open_channel():
         made.append(first if not made else StubChannel())
         return made[-1]
 
-    return Speaker(open_channel, linger=TEST_LINGER), made
+    return Speaker(open_channel, linger=TEST_LINGER, **options), made
 
 
 async def until(condition, timeout=2.0):
@@ -854,6 +854,80 @@ async def test_close_during_a_stalled_talk_write_returns_at_once():
 
     assert stalled.closed
     assert leftover(before) == []
+
+
+async def test_an_open_failing_after_the_talk_ended_still_warns(caplog):
+    slow = StubChannel(hold="open", error=ConnectError("timed out"))
+    speaker, _ = stub_speaker(slow, hangover=TEST_HANGOVER)
+    speaker.feed_talk(SSRC, voice())
+    await asyncio.wait_for(slow.held.wait(), 1)
+    await until(lambda: speaker.owner is None, 1)
+
+    slow.release.set()
+
+    await until(lambda: speaker_warnings(caplog), 1)
+    await speaker.close()
+
+
+async def test_a_write_failing_after_the_talk_ended_still_warns(caplog):
+    stalled = StubChannel(hold="send", error=ConnectError("the camera took no data"))
+    speaker, _ = stub_speaker(stalled, hangover=TEST_HANGOVER)
+    speaker.feed_talk(SSRC, voice())
+    await asyncio.wait_for(stalled.held.wait(), 1)
+    await until(lambda: speaker.owner is None, 1)
+
+    stalled.release.set()
+
+    await until(lambda: speaker_warnings(caplog), 1)
+    assert stalled.closed
+    await speaker.close()
+
+
+async def test_an_open_failing_after_a_newer_talk_took_over_is_quiet(caplog):
+    slow = StubChannel(hold="open", error=ConnectError("timed out"))
+    speaker, made = stub_speaker(slow, hangover=TEST_HANGOVER)
+    speaker.feed_talk(1, voice())
+    await asyncio.wait_for(slow.held.wait(), 1)
+    speaker.feed_talk(2, voice(2000))
+
+    slow.release.set()
+
+    await until(lambda: len(made) == 2 and made[1].frames == 1, 1)
+    assert speaker_warnings(caplog) == []
+    await speaker.close()
+
+
+async def test_close_right_after_the_open_finishes_closes_the_session():
+    opening = StubChannel(hold="open")
+    speaker, made = stub_speaker(opening)
+    speaker.feed_talk(SSRC, voice())
+    await asyncio.wait_for(opening.held.wait(), 1)
+
+    opening.release.set()
+    await asyncio.sleep(0)
+    await asyncio.wait_for(speaker.close(), 1)
+
+    assert opening.closed
+    assert len(made) == 1
+
+
+async def test_a_play_cancelled_right_after_the_open_finishes_keeps_the_session():
+    opening = StubChannel(hold="open")
+    speaker, made = stub_speaker(opening)
+    playing = asyncio.create_task(speaker.play(Producer()))
+    await asyncio.wait_for(opening.held.wait(), 1)
+
+    opening.release.set()
+    await asyncio.sleep(0)
+    playing.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await playing
+    assert await speaker.play(chunks(tone(1))) is True
+    assert len(made) == 1
+    assert opening.frames == 1
+    await speaker.close()
+    assert opening.closed
 
 
 async def test_feed_after_close_is_ignored(rtsp, speaker, monkeypatch):
