@@ -1,9 +1,15 @@
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
+
+from .audio import decode_alaw, decode_ulaw
+from .backchannel import _find_track
+from .errors import ProtocolError
+from .speaker import Speaker
 
 _log = logging.getLogger(__name__)
 
@@ -15,6 +21,8 @@ _HEAD_END = b"\r\n\r\n"
 _FRAME = ord("$")
 # go2rtc reads text with these starts as RTSP and skips other bytes up to the next frame
 _TEXT_STARTS = frozenset(b"RTSP OPTI DESC SETU PLAY PAUS TEAR GET_ SET_ ANNO RECO".split())
+_INTERLEAVED = re.compile(r"interleaved=([0-9]+)")
+_DECODERS: dict[int, Callable[[bytes], bytes]] = {0: decode_ulaw, 8: decode_alaw}
 
 
 @dataclass(frozen=True)
@@ -39,7 +47,8 @@ class _Head:
 @dataclass
 class _Forwarded:
     cseq: str
-    track: str | None
+    method: str
+    uri: str
     after: list[bytes] = field(default_factory=list)
 
 
@@ -51,11 +60,13 @@ class RtspRelay:
         *,
         listen_host: str = "127.0.0.1",
         timeout: float = 10.0,
+        speaker: Speaker | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._listen_host = listen_host
         self._timeout = timeout
+        self._speaker = speaker
         self._server: asyncio.Server | None = None
         self._bound = 0
         self._connections: dict[asyncio.Task[None], list[asyncio.StreamWriter]] = {}
@@ -113,7 +124,7 @@ class RtspRelay:
             )
             return
         writers.append(camera_writer)
-        link = _Link(peer, client_writer, camera_writer)
+        link = _Link(peer, client_writer, camera_writer, self._speaker)
         pumps = (
             asyncio.create_task(
                 _pump("client to camera", client_reader, link.from_client, camera_writer)
@@ -137,27 +148,33 @@ class RtspRelay:
 
 class _Link:
     def __init__(
-        self, peer: object, client: asyncio.StreamWriter, camera: asyncio.StreamWriter
+        self,
+        peer: object,
+        client: asyncio.StreamWriter,
+        camera: asyncio.StreamWriter,
+        speaker: Speaker | None,
     ) -> None:
         self._peer = peer
         self._client = client
         self._camera = camera
+        self._speaker = speaker
         self._tracks: dict[str, dict[str, str]] = {}
         self._pending: list[_Forwarded] = []
+        self._session: str | None = None
+        self._talk_track: str | None = None
+        self._talk_channel: int | None = None
+        self._dropped = False
+        self._failed = False
 
     def from_client(self, buffer: bytearray) -> int:
         sent = done = 0
         for start, end, head in _split(buffer):
             done = end
-            if head is None or head.is_reply:
-                continue
-            reply = self._request(head)
-            if reply is None:
+            if not self._consumed(buffer, start, end, head):
                 continue
             if start > sent:
                 self._camera.write(buffer[sent:start])
             sent = end
-            self._answer(reply)
         if done > sent:
             self._camera.write(buffer[sent:done])
         return done
@@ -168,7 +185,7 @@ class _Link:
             done = end
             if head is None or not head.is_reply:
                 continue
-            waiting = self._answered(head)
+            waiting = self._answered(head, bytes(buffer[end - head.length : end]))
             if waiting:
                 self._client.write(buffer[sent:end])
                 self._client.writelines(waiting)
@@ -177,22 +194,74 @@ class _Link:
             self._client.write(buffer[sent:done])
         return done
 
+    def _consumed(self, buffer: bytearray, start: int, end: int, head: _Head | None) -> bool:
+        if head is None:
+            return self._talk(buffer, start, end)
+        if head.is_reply:
+            return False
+        reply = self._request(head)
+        if reply is None:
+            return False
+        self._answer(reply)
+        return True
+
     def _request(self, head: _Head) -> bytes | None:
         method = head.words[0]
-        path = urlsplit(head.uri).path.rstrip("/")
+        path = _path(head.uri)
+        if method == "SETUP" and path == self._talk_track:
+            return self._setup_talk(head)
         known = self._tracks.get(path) if method == "SETUP" else None
         if known is not None:
             # the camera answers 455 to a second SETUP of a track (protocol.md, Backchannel)
             _log.debug("relay for %s answered a repeated SETUP of %s", self._peer, path)
-            lines = ["RTSP/1.0 200 OK", f"CSeq: {head.headers.get('cseq', '0')}"]
-            lines += [f"{name}: {value}" for name, value in known.items()]
-            return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+            return _reply(head, known)
         if method == "TEARDOWN":
             self._tracks.clear()
+            self._session = None
         cseq = head.headers.get("cseq")
         if cseq is not None:
-            self._pending.append(_Forwarded(cseq, path if method == "SETUP" else None))
+            self._pending.append(_Forwarded(cseq, method, head.uri))
         return None
+
+    def _setup_talk(self, head: _Head) -> bytes:
+        transport = head.headers.get("transport", "")
+        if found := _INTERLEAVED.search(transport):
+            self._talk_channel = int(found[1])
+        _log.debug(
+            "relay for %s answered the backchannel SETUP, talk on channel %s",
+            self._peer, self._talk_channel,
+        )
+        headers = {"Session": self._session, "Transport": transport}
+        return _reply(head, {name: value for name, value in headers.items() if value})
+
+    def _talk(self, buffer: bytearray, start: int, end: int) -> bool:
+        channel = self._talk_channel
+        if self._speaker is None or channel is None or buffer[start] != _FRAME:
+            return False
+        if buffer[start + 1] == channel:
+            self._feed(self._speaker, bytes(buffer[start + 4 : end]))
+            return True
+        return buffer[start + 1] == channel + 1
+
+    def _feed(self, speaker: Speaker, packet: bytes) -> None:
+        rtp = _rtp(packet)
+        decode = None if rtp is None else _DECODERS.get(rtp[0])
+        if rtp is None or decode is None:
+            if not self._dropped:
+                self._dropped = True
+                _log.debug(
+                    "relay for %s drops talk RTP it cannot decode: %s",
+                    self._peer, packet[:12].hex(),
+                )
+            return
+        _, ssrc, payload = rtp
+        # a speaker fault must not cut the live video this connection carries
+        try:
+            speaker.feed_talk(ssrc, decode(payload))
+        except Exception:
+            if not self._failed:
+                self._failed = True
+                _log.exception("relay for %s cannot pass talk to the speaker", self._peer)
 
     def _answer(self, reply: bytes) -> None:
         if self._pending:
@@ -200,7 +269,7 @@ class _Link:
         else:
             self._client.write(reply)
 
-    def _answered(self, head: _Head) -> list[bytes]:
+    def _answered(self, head: _Head, body: bytes) -> list[bytes]:
         cseq = head.headers.get("cseq")
         index = next(
             (n for n, request in enumerate(self._pending) if request.cseq == cseq), None
@@ -211,17 +280,32 @@ class _Link:
             )
             return []
         request = self._pending.pop(index)
-        if request.track is not None and head.status == "200":
-            self._tracks[request.track] = {
-                name: head.headers[name.lower()]
-                for name in ("Session", "Transport")
-                if name.lower() in head.headers
-            }
+        if head.status == "200":
+            self._learn(request, head, body)
         if index:
             # a held local reply still waits for the requests sent before it
             self._pending[index - 1].after += request.after
             return []
         return request.after
+
+    def _learn(self, request: _Forwarded, head: _Head, body: bytes) -> None:
+        if request.method == "SETUP":
+            self._tracks[_path(request.uri)] = {
+                name: head.headers[name.lower()]
+                for name in ("Session", "Transport")
+                if name.lower() in head.headers
+            }
+            session = head.headers.get("session", "").split(";")[0].strip()
+            if self._session is None and session:
+                self._session = session
+        elif request.method == "DESCRIBE" and self._speaker is not None:
+            base = head.headers.get("content-base", request.uri)
+            try:
+                track = _find_track(body.decode("latin-1"), base)
+                self._talk_track = None if track is None else _path(track[0])
+            except (ProtocolError, ValueError) as err:
+                self._talk_track = None
+                _log.debug("relay for %s finds no usable backchannel: %s", self._peer, err)
 
 
 async def _pump(
@@ -280,6 +364,30 @@ def _parse_head(text: str) -> _Head:
     if int(length) > _MAX_BODY:
         raise ValueError(f"Content-Length {length} is above {_MAX_BODY}")
     return _Head(start.split(), headers, int(length))
+
+
+def _path(uri: str) -> str:
+    return urlsplit(uri).path.rstrip("/")
+
+
+def _reply(request: _Head, headers: dict[str, str]) -> bytes:
+    lines = ["RTSP/1.0 200 OK", f"CSeq: {request.headers.get('cseq', '0')}"]
+    lines += [f"{name}: {value}" for name, value in headers.items()]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+def _rtp(packet: bytes) -> tuple[int, int, bytes] | None:
+    if len(packet) < 12 or packet[0] >> 6 != 2:
+        return None
+    start = 12 + 4 * (packet[0] & 0x0F)
+    if packet[0] & 0x10:
+        if len(packet) < start + 4:
+            return None
+        start += 4 + 4 * int.from_bytes(packet[start + 2 : start + 4], "big")
+    end = len(packet) - (packet[-1] if packet[0] & 0x20 else 0)
+    if end <= start:
+        return None
+    return packet[1] & 0x7F, int.from_bytes(packet[8:12], "big"), packet[start:end]
 
 
 async def _shut(writer: asyncio.StreamWriter) -> None:

@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 
 from sannce_aio import relay as relay_module
+from sannce_aio.audio import decode_alaw, decode_ulaw
 from sannce_aio.relay import RtspRelay
 from sannce_aio.simulator_rtsp import RtspFront
 
@@ -17,7 +18,10 @@ from .rtsp_fake import FakeRtspCamera, RawClient
 
 REQUIRE = "Require: www.onvif.org/ver20/backchannel\r\n"
 TRANSPORT = "Transport: RTP/AVP/TCP;unicast;interleaved=4-5\r\n"
-SESSION = "6C7E1F0A;timeout=60"
+VIDEO = "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+AUDIO = "Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n"
+SESSION_ID = "6C7E1F0A"
+SESSION = f"{SESSION_ID};timeout=60"
 REFUSED = "455 Method Not Valid in This State"
 # more than the loopback socket buffers hold
 FLOOD = struct.pack("!cBH", b"$", 0, 0xFFFF) + b"v" * 0xFFFF
@@ -37,6 +41,15 @@ class Reply(NamedTuple):
 
 def frame(channel, payload):
     return struct.pack("!cBH", b"$", channel, len(payload)) + payload
+
+
+def rtp(payload_type, ssrc, payload, *, csrcs=(), extension=None, padding=0):
+    first = 0x80 | len(csrcs) | (0x10 if extension is not None else 0) | (0x20 if padding else 0)
+    packet = struct.pack("!BBHII", first, payload_type, 1, 160, ssrc)
+    packet += b"".join(struct.pack("!I", csrc) for csrc in csrcs)
+    if extension is not None:
+        packet += struct.pack("!HH", 0xBEDE, len(extension) // 4) + extension
+    return packet + payload + (bytes(padding - 1) + bytes([padding]) if padding else b"")
 
 
 def free_port():
@@ -70,6 +83,9 @@ class Camera:
         self.hold = asyncio.Event()
         self.hold.set()
         self.held = {"GET_PARAMETER"}
+        self.unanswered = set()
+        self.control = "trackID=3"
+        self.talk_types = "0 8"
         self._server = None
 
     @property
@@ -101,6 +117,8 @@ class Camera:
                 method, url, _ = start.split(" ")
                 headers = dict(line.split(": ", 1) for line in lines)
                 peer.requests.append((method, url, headers))
+                if method in self.unanswered:
+                    continue
                 if method in self.held:
                     await self.hold.wait()
                 writer.write(self._reply(peer, method, url, headers).encode())
@@ -111,16 +129,22 @@ class Camera:
             peer.closed.set()
             writer.close()
 
-    @staticmethod
-    def _reply(peer, method, url, headers):
+    def describe(self, cseq, url):
+        body = (
+            f"v=0\r\nm=video 0 RTP/AVP 96\r\na=recvonly\r\na=control:{url}/trackID=1\r\n"
+            f"m=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:{url}/trackID=2\r\n"
+            f"m=audio 0 RTP/AVP {self.talk_types}\r\na=sendonly\r\na=control:{self.control}\r\n"
+        )
+        return (
+            f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Base: {url}/\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n{body}"
+        )
+
+    def _reply(self, peer, method, url, headers):
         cseq = headers["CSeq"]
         path = urlsplit(url).path.rstrip("/")
         if method == "DESCRIBE":
-            body = f"v=0\r\nm=audio 0 RTP/AVP 0 8\r\na=sendonly\r\na=control:{url}/trackID=3\r\n"
-            return (
-                f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Base: {url}/\r\n"
-                f"Content-Length: {len(body)}\r\n\r\n{body}"
-            )
+            return self.describe(cseq, url)
         if method == "SETUP" and path in peer.tracks:
             return f"RTSP/1.0 {REFUSED}\r\nCSeq: {cseq}\r\n\r\n"
         if method == "SETUP":
@@ -189,8 +213,8 @@ async def camera():
 
 
 @contextlib.asynccontextmanager
-async def running(port, timeout=1.0):
-    relay = RtspRelay("127.0.0.1", port, timeout=timeout)
+async def running(port, timeout=1.0, **options):
+    relay = RtspRelay("127.0.0.1", port, timeout=timeout, **options)
     await relay.start()
     try:
         yield relay
@@ -603,3 +627,271 @@ async def test_through_the_relay_the_simulator_takes_a_repeated_backchannel_setu
 
     assert first.startswith("RTSP/1.0 200")
     assert second.startswith("RTSP/1.0 200")
+
+
+class FakeSpeaker:
+    def __init__(self):
+        self.talk = []
+
+    def feed_talk(self, ssrc, pcm):
+        self.talk.append((ssrc, pcm))
+
+
+class BrokenSpeaker:
+    def feed_talk(self, ssrc, pcm):
+        raise RuntimeError("the speaker broke")
+
+
+@pytest.fixture
+def speaker():
+    return FakeSpeaker()
+
+
+@pytest_asyncio.fixture
+async def speaker_client(camera, speaker):
+    async with running(camera.port, speaker=speaker) as relay:
+        connected = await Client.connect(relay.port)
+        yield connected
+        connected.close()
+
+
+async def start_talk(client):
+    await client.request("DESCRIBE", extra=REQUIRE)
+    await client.request("SETUP", "/trackID=1", VIDEO)
+    await client.request("PLAY")
+    return await client.request("SETUP", "/trackID=3", TRANSPORT)
+
+
+async def test_a_backchannel_setup_is_answered_by_the_relay(camera, speaker_client):
+    reply = await start_talk(speaker_client)
+
+    assert (reply.status, reply.headers["cseq"]) == (200, "4")
+    assert reply.headers["transport"] == "RTP/AVP/TCP;unicast;interleaved=4-5"
+    assert reply.headers["session"] == SESSION_ID
+    assert setups(camera) == [speaker_client.base + "/trackID=1"]
+
+
+async def test_a_backchannel_setup_before_any_session_has_no_session_header(
+    camera, speaker_client
+):
+    await speaker_client.request("DESCRIBE", extra=REQUIRE)
+    talk = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+    audio = await speaker_client.request("SETUP", "/trackID=2", AUDIO)
+    again = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+
+    assert (talk.status, audio.status, again.status) == (200, 200, 200)
+    assert "session" not in talk.headers
+    assert audio.headers["session"] == SESSION
+    assert again.headers["session"] == SESSION_ID
+    _, url, headers = camera.peer.requests[-1]
+    assert url == speaker_client.base + "/trackID=2"
+    assert "Session" not in headers
+    assert setups(camera) == [speaker_client.base + "/trackID=2"]
+
+
+async def test_an_absolute_backchannel_control_url_is_matched_by_path(camera, speaker_client):
+    camera.control = "rtsp://192.0.2.7:554/1/2/trackID=3"
+    await speaker_client.request("DESCRIBE", extra=REQUIRE)
+    reply = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+
+    assert reply.status == 200
+    assert setups(camera) == []
+
+
+async def test_a_backchannel_without_g711_is_left_to_the_camera(camera, speaker_client):
+    camera.talk_types = "97"
+    await speaker_client.request("DESCRIBE", extra=REQUIRE)
+    reply = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+
+    assert reply.headers["transport"].endswith(";ssrc=4B1D")
+    assert setups(camera) == [speaker_client.base + "/trackID=3"]
+
+
+async def test_a_teardown_keeps_the_backchannel_path(camera, speaker_client):
+    await start_talk(speaker_client)
+    await speaker_client.request("TEARDOWN")
+    reply = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+
+    assert reply.status == 200
+    assert "session" not in reply.headers
+    assert setups(camera) == [speaker_client.base + "/trackID=1"]
+
+
+async def test_pcmu_talk_frames_are_decoded_and_fed_by_ssrc(camera, speaker, speaker_client):
+    await start_talk(speaker_client)
+    payload = bytes(range(160))
+
+    speaker_client.writer.write(frame(4, rtp(0, 0xABCD, payload)))
+    await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == [(0xABCD, decode_ulaw(payload))]
+    assert camera.peer.frames == []
+
+
+async def test_pcma_talk_frames_are_decoded(camera, speaker, speaker_client):
+    await start_talk(speaker_client)
+    payload = bytes(range(96, 256))
+
+    speaker_client.writer.write(frame(4, rtp(8 | 0x80, 7, payload)))
+    await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == [(7, decode_alaw(payload))]
+
+
+async def test_rtp_with_csrcs_extension_and_padding_yields_the_payload(speaker, speaker_client):
+    await start_talk(speaker_client)
+    payload = bytes(range(160))
+    packet = rtp(0, 0x1234, payload, csrcs=(1, 2), extension=b"\x01\x02\x03\x04" * 2, padding=4)
+
+    speaker_client.writer.write(frame(4, packet))
+    await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == [(0x1234, decode_ulaw(payload))]
+
+
+async def test_a_talk_frame_split_across_reads_is_fed_once(speaker, speaker_client):
+    await start_talk(speaker_client)
+    payload = bytes(range(160))
+    data = frame(4, rtp(0, 9, payload))
+
+    for piece in (data[:2], data[2:15], data[15:]):
+        speaker_client.writer.write(piece)
+        await speaker_client.writer.drain()
+        await asyncio.sleep(0.02)
+    await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == [(9, decode_ulaw(payload))]
+
+
+async def test_rtcp_on_the_next_channel_is_dropped(camera, speaker, speaker_client):
+    await start_talk(speaker_client)
+    report = b"\x80\xc9\x00\x01" + b"\x00" * 4
+    payload = bytes(range(160))
+
+    speaker_client.writer.write(
+        frame(5, report) + frame(4, rtp(0, 1, payload)) + frame(1, report)
+    )
+    await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == [(1, decode_ulaw(payload))]
+    assert camera.peer.frames == [Frame(1, report)]
+
+
+async def test_other_payload_types_and_short_packets_are_dropped(
+    camera, speaker, speaker_client, caplog
+):
+    await start_talk(speaker_client)
+    payload = b"\x55" * 160
+    bad = [
+        rtp(96, 1, payload),
+        b"\x80\x00",
+        bytes([0x40, 0]) + bytes(10) + payload,
+        rtp(0, 1, b"", extension=b"\x00" * 4)[:-4] + b"\x00\x09",
+        rtp(0, 1, b"\x00" * 4, padding=4)[:-1] + bytes([200]),
+        rtp(0, 1, b""),
+    ]
+
+    with caplog.at_level(logging.DEBUG, logger="sannce_aio.relay"):
+        speaker_client.writer.write(b"".join(frame(4, packet) for packet in bad))
+        speaker_client.writer.write(frame(4, rtp(97, 1, payload)))
+        await speaker_client.request("OPTIONS")
+
+    assert speaker.talk == []
+    assert camera.peer.frames == []
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+
+
+async def test_video_frames_and_requests_still_pass_around_talk_frames(
+    camera, speaker, speaker_client
+):
+    await start_talk(speaker_client)
+    report = b"\x80\xc9\x00\x01" + b"\x00" * 4
+    payload = bytes(range(160))
+
+    speaker_client.writer.write(
+        frame(0, report)
+        + frame(4, rtp(0, 1, payload))
+        + speaker_client.encode("GET_PARAMETER")
+        + frame(4, rtp(0, 1, payload))
+    )
+    reply = await speaker_client.receive()
+    await until(lambda: len(speaker.talk) == 2)
+
+    assert (reply.status, reply.headers["cseq"]) == (200, "5")
+    assert camera.peer.frames == [Frame(0, report)]
+    assert camera.peer.requests[-1][0] == "GET_PARAMETER"
+
+
+async def test_a_describe_reply_split_across_reads_still_finds_the_track(
+    camera, speaker_client
+):
+    camera.unanswered = {"DESCRIBE"}
+    speaker_client.send("DESCRIBE", extra=REQUIRE)
+    await until(lambda: camera.peers and camera.peer.requests)
+    data = camera.describe("1", speaker_client.base).encode()
+
+    for piece in (data[:3], data[3:40], data[40:-30], data[-30:]):
+        camera.peer.send(piece)
+        await camera.peer.writer.drain()
+        await asyncio.sleep(0.02)
+    described = await speaker_client.receive()
+    reply = await speaker_client.request("SETUP", "/trackID=3", TRANSPORT)
+
+    assert (described.status, reply.status) == (200, 200)
+    assert setups(camera) == []
+
+
+async def test_a_local_backchannel_reply_waits_for_an_earlier_camera_reply(
+    camera, speaker_client
+):
+    await speaker_client.request("DESCRIBE", extra=REQUIRE)
+    await speaker_client.request("SETUP", "/trackID=1", VIDEO)
+    camera.hold.clear()
+
+    speaker_client.send("GET_PARAMETER")
+    speaker_client.send("SETUP", "/trackID=3", TRANSPORT)
+    await until(lambda: camera.peer.requests[-1][0] == "GET_PARAMETER")
+    await asyncio.sleep(0.05)
+    camera.hold.set()
+    first, second = await speaker_client.receive(), await speaker_client.receive()
+
+    assert (first.headers["cseq"], second.headers["cseq"]) == ("3", "4")
+    assert second.headers["transport"] == "RTP/AVP/TCP;unicast;interleaved=4-5"
+    assert setups(camera) == [speaker_client.base + "/trackID=1"]
+
+
+async def test_without_a_speaker_the_backchannel_setup_reaches_the_camera(camera, client):
+    await client.request("DESCRIBE", extra=REQUIRE)
+    reply = await client.request("SETUP", "/trackID=3", TRANSPORT)
+    talk = frame(4, rtp(0, 1, bytes(160)))
+    client.writer.write(talk)
+    await client.request("OPTIONS")
+
+    assert reply.headers["transport"].endswith(";ssrc=4B1D")
+    assert setups(camera) == [client.base + "/trackID=3"]
+    assert camera.peer.frames == [Frame(4, talk[4:])]
+
+
+async def test_a_failing_speaker_does_not_stop_video(camera, caplog):
+    async with running(camera.port, speaker=BrokenSpeaker()) as relay:
+        client = await Client.connect(relay.port)
+        try:
+            await start_talk(client)
+            report = b"\x80\xc9\x00\x01" + b"\x00" * 4
+            talk = frame(4, rtp(0, 1, bytes(range(160))))
+            with caplog.at_level(logging.DEBUG, logger="sannce_aio.relay"):
+                client.writer.write(talk + frame(0, report) + talk)
+                first = await client.request("OPTIONS")
+                client.writer.write(talk)
+                second = await client.request("GET_PARAMETER")
+            camera.peer.send(frame(0, b"v" * 1400))
+            video = await client.receive()
+        finally:
+            client.close()
+
+    assert (first.status, second.status) == (200, 200)
+    assert camera.peer.frames == [Frame(0, report)]
+    assert video == Frame(0, b"v" * 1400)
+    errors = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(errors) == 1
+    assert errors[0].exc_info[0] is RuntimeError
