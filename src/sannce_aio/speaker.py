@@ -21,6 +21,7 @@ _log = logging.getLogger(__name__)
 
 class _Source:
     kind: ClassVar[Owner]
+    preempted = False
 
 
 class _Play(_Source):
@@ -35,7 +36,6 @@ class _Talk(_Source):
         self.pending = bytearray()
         self.last_frame = 0.0
         self.last_voice = -math.inf
-        self.muted = False
 
     def push(self, pcm: bytes) -> None:
         self.pending += pcm
@@ -112,7 +112,7 @@ class Speaker:
         if _is_voice(pcm):
             started = now - talk.last_voice >= self._hangover
             talk.last_voice = now
-            if self._owner is not talk and (started or (talk.muted and self._owner is None)):
+            if self._owner is not talk and (started or (talk.preempted and self._owner is None)):
                 self._take_talk(talk)
         if self._owner is talk:
             talk.push(pcm)
@@ -192,6 +192,7 @@ class Speaker:
                     # the open may succeed just before our cancel: keep the session, or it leaks
                     if opening.done() and not opening.cancelled() and opening.exception() is None:
                         self._channel = channel
+                        self._failing = False
                     # close() cancels the open; a cancel of our own task must propagate
                     task = asyncio.current_task()
                     if task is not None and task.cancelling():
@@ -211,10 +212,9 @@ class Speaker:
             return self._channel
 
     def _superseded(self, source: _Source) -> bool:
-        return self._closed or (self._owner is not None and self._owner is not source)
+        return self._closed or source.preempted
 
     def _take_talk(self, talk: _Talk) -> None:
-        talk.muted = False
         self._take(talk)
         if self._pump is None or self._pump.done():
             self._pump = asyncio.create_task(self._pump_talk())
@@ -260,9 +260,10 @@ class Speaker:
         previous = self._owner
         if previous is not None:
             _log.debug("a %s took the speaker from a %s", source.kind, previous.kind)
+            previous.preempted = True
         if isinstance(previous, _Talk):
-            previous.muted = True
             previous.drop()
+        source.preempted = False
         self._set_owner(source)
 
     def _free(self, source: _Source) -> None:

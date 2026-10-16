@@ -897,6 +897,80 @@ async def test_an_open_failing_after_a_newer_talk_took_over_is_quiet(caplog):
     await speaker.close()
 
 
+@pytest.mark.parametrize("hold", ["open", "send"])
+async def test_a_play_preempted_by_a_talk_that_ended_stays_quiet(hold):
+    held = StubChannel(hold=hold, error=ConnectError("timed out"))
+    speaker, _ = stub_speaker(held, hangover=TEST_HANGOVER)
+    playing = asyncio.create_task(speaker.play(chunks(tone(3))))
+    await asyncio.wait_for(held.held.wait(), 1)
+    speaker.feed_talk(SSRC, voice())
+    await until(lambda: speaker.owner is None, 1)
+
+    held.release.set()
+
+    assert await asyncio.wait_for(playing, 1) is False
+    await speaker.close()
+
+
+@pytest.mark.parametrize("hold", ["open", "send"])
+async def test_a_play_preempted_by_a_cancelled_play_stays_quiet(hold):
+    held = StubChannel(hold=hold, error=ConnectError("timed out"))
+    speaker, _ = stub_speaker(held)
+    owners = []
+    speaker.subscribe(owners.append)
+    first = asyncio.create_task(speaker.play(chunks(tone(3))))
+    await asyncio.wait_for(held.held.wait(), 1)
+    second = asyncio.create_task(speaker.play(Producer()))
+    await until(lambda: owners.count("play") == 2)
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    assert speaker.owner is None
+
+    held.release.set()
+
+    assert await asyncio.wait_for(first, 1) is False
+    await speaker.close()
+
+
+async def test_a_talk_that_retook_the_speaker_warns_when_its_open_fails(caplog):
+    slow = StubChannel(hold="open", error=ConnectError("timed out"))
+    speaker, _ = stub_speaker(slow, hangover=TEST_HANGOVER)
+    speaker.feed_talk(SSRC, voice())
+    await asyncio.wait_for(slow.held.wait(), 1)
+    assert await speaker.play(chunks()) is True
+    speaker.feed_talk(SSRC, voice())
+    assert speaker.owner == "talk"
+
+    slow.release.set()
+
+    await until(lambda: speaker.owner is None, 1)
+    assert len(speaker_warnings(caplog)) == 1
+    await speaker.close()
+
+
+async def test_a_session_kept_from_a_cancelled_play_ends_the_failure_streak(caplog):
+    kept = StubChannel(hold="open")
+    channels = iter([failing_channel(), kept, failing_channel()])
+    speaker = Speaker(lambda: next(channels), linger=0.05, hangover=TEST_HANGOVER)
+    speaker.feed_talk(1, voice())
+    await until(lambda: speaker.owner is None, 1)
+    playing = asyncio.create_task(speaker.play(Producer()))
+    await asyncio.wait_for(kept.held.wait(), 1)
+    kept.release.set()
+    await asyncio.sleep(0)
+    playing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await playing
+    await until(lambda: kept.closed, 1)
+
+    speaker.feed_talk(2, voice())
+    await until(lambda: speaker.owner is None, 1)
+
+    await speaker.close()
+    assert len(speaker_warnings(caplog)) == 2
+
+
 async def test_close_right_after_the_open_finishes_closes_the_session():
     opening = StubChannel(hold="open")
     speaker, made = stub_speaker(opening)
