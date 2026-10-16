@@ -144,6 +144,40 @@ async def test_stream_sends_get_parameter_on_long_streams(rtsp):
     assert "GET_PARAMETER" in [method for method, _, _ in rtsp.requests]
 
 
+async def test_send_continues_sequence_timestamp_and_ssrc_across_calls(rtsp):
+    bc = channel(rtsp)
+    await bc.open()
+    await bc.send(bytes(FRAME_BYTES))
+    await bc.send(bytes(FRAME_BYTES))
+    await asyncio.sleep(0.3)
+    await bc.send(bytes(FRAME_BYTES))
+    await bc.close()
+
+    headers = [struct.unpack("!BBHII", packet[:12]) for _, packet in rtsp.packets]
+    seq, timestamp = headers[0][2], headers[0][3]
+    assert [h[2] for h in headers] == [(seq + n) & 0xFFFF for n in range(3)]
+    assert [h[3] for h in headers] == [(timestamp + 160 * n) & 0xFFFFFFFF for n in range(3)]
+    assert len({h[4] for h in headers}) == 1
+
+
+async def test_send_after_a_gap_resyncs_instead_of_bursting(rtsp):
+    bc = channel(rtsp)
+    await bc.open()
+    await bc.send(bytes(FRAME_BYTES))
+    await asyncio.sleep(0.5)
+    for _ in range(10):
+        await bc.send(bytes(FRAME_BYTES))
+    await bc.close()
+
+    last = rtsp.arrivals[-10:]
+    assert last[-1] - last[0] >= 0.15
+
+
+async def test_send_before_open_raises_connect_error():
+    with pytest.raises(ConnectError):
+        await Backchannel("127.0.0.1", 1, "/1/1", "admin", "pw").send(bytes(FRAME_BYTES))
+
+
 async def test_close_sends_teardown(rtsp):
     bc = channel(rtsp)
     await bc.open()

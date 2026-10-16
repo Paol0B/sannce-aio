@@ -22,6 +22,7 @@ _ENCODERS: dict[int, Callable[[bytes], bytes]] = {_PCMA: encode_alaw, _PCMU: enc
 _BUSY = frozenset({453, 454, 455, 461})
 _READ_SIZE = 0x10000
 _CLOSE_SECONDS = 2.0
+_RESYNC_SECONDS = 0.2
 
 
 class Backchannel:
@@ -51,6 +52,11 @@ class Backchannel:
         self._session: str | None = None
         self._payload_type = _PCMA
         self._drain: asyncio.Task[None] | None = None
+        self._seq = 0
+        self._timestamp = 0
+        self._ssrc = 0
+        self._due = 0.0
+        self._last_keepalive = 0.0
 
     async def has_backchannel(self) -> bool:
         await self._connect()
@@ -82,52 +88,41 @@ class Backchannel:
         except BaseException:
             await self._abort()
             raise
+        self._seq = random.randrange(0x10000)
+        self._timestamp = random.randrange(0x100000000)
+        self._ssrc = int.from_bytes(os.urandom(4), "big")
+        self._due = self._last_keepalive = asyncio.get_running_loop().time()
         self._drain = asyncio.create_task(self._discard_incoming())
 
-    async def stream(self, pcm: AsyncIterable[bytes]) -> None:
-        writer = self._writer
-        if writer is None or self._session is None:
+    async def send(self, frame: bytes) -> None:
+        if self._writer is None or self._session is None:
             raise ConnectError("the backchannel is not open")
-        encode = _ENCODERS[self._payload_type]
         loop = asyncio.get_running_loop()
-        seq = random.randrange(0x10000)
-        timestamp = random.randrange(0x100000000)
-        ssrc = int.from_bytes(os.urandom(4), "big")
-        start: float | None = None
-        last_keepalive = loop.time()
-        sent = 0
+        now = loop.time()
+        if now - self._due > _RESYNC_SECONDS:
+            self._due = now
+        if self._due > now:
+            await asyncio.sleep(self._due - now)
+        rtp = struct.pack(
+            "!BBHII", 0x80, self._payload_type, self._seq, self._timestamp, self._ssrc
+        ) + _ENCODERS[self._payload_type](frame)
+        await self._write(struct.pack("!cBH", b"$", _CHANNEL, len(rtp)) + rtp)
+        self._seq = (self._seq + 1) & 0xFFFF
+        self._timestamp = (self._timestamp + _FRAME_SAMPLES) & 0xFFFFFFFF
+        self._due += _FRAME_SECONDS
+        if loop.time() - self._last_keepalive >= self._keepalive:
+            self._last_keepalive = loop.time()
+            await self._write(self._request_bytes("GET_PARAMETER", self._url, {}))
+
+    async def stream(self, pcm: AsyncIterable[bytes]) -> None:
         buffer = bytearray()
-
-        async def send(frame: bytes) -> None:
-            nonlocal start, sent, last_keepalive
-            now = loop.time()
-            if start is None:
-                start = now
-            delay = start + sent * _FRAME_SECONDS - now
-            if delay > 0:
-                await asyncio.sleep(delay)
-            rtp = struct.pack(
-                "!BBHII",
-                0x80,
-                self._payload_type,
-                (seq + sent) & 0xFFFF,
-                (timestamp + sent * _FRAME_SAMPLES) & 0xFFFFFFFF,
-                ssrc,
-            ) + encode(frame)
-            packet = struct.pack("!cBH", b"$", _CHANNEL, len(rtp)) + rtp
-            await self._write(packet)
-            sent += 1
-            if loop.time() - last_keepalive >= self._keepalive:
-                last_keepalive = loop.time()
-                await self._write(self._request_bytes("GET_PARAMETER", self._url, {}))
-
         async for chunk in pcm:
             buffer += chunk
             while len(buffer) >= FRAME_BYTES:
-                await send(bytes(buffer[:FRAME_BYTES]))
+                await self.send(bytes(buffer[:FRAME_BYTES]))
                 del buffer[:FRAME_BYTES]
         if buffer:
-            await send(bytes(buffer) + bytes(FRAME_BYTES - len(buffer)))
+            await self.send(bytes(buffer) + bytes(FRAME_BYTES - len(buffer)))
 
     async def close(self) -> None:
         if self._writer is not None and self._session is not None:
