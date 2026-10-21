@@ -1,6 +1,26 @@
 # sannce-aio
 
-Asyncio library for SANNCE / Tiandy wired IP cameras on the LAN. The reference model is the I91FW. The camera reports it as I91FX.
+[![CI](https://github.com/Paol0B/sannce-aio/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Paol0B/sannce-aio/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/LICENSE)
+[![Python 3.11 to 3.14](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/pyproject.toml)
+[![Typed](https://img.shields.io/badge/typing-mypy%20strict-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/pyproject.toml)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+
+Asyncio library for SANNCE / Tiandy wired IP cameras on the LAN. The reference model is the I91FW. The camera reports it as I91FX. It powers the Home Assistant integration [ha-sannce](https://github.com/Paol0B/ha-sannce).
+
+> **Independent project.** SANNCE and Tiandy do not make, endorse or support it. Read [Legal](#legal) before you use it.
+
+## Features
+
+- Pushed events: motion, vehicle, intrusion, line crossing, tamper and video loss.
+- Floodlight, light mode, detection switches, motion sensitivity and volume over HTTP.
+- Built-in warning sounds, and your own audio through the RTSP backchannel.
+- One owner for the camera speaker: the newest play or talk takes it, and it is free again when that one ends.
+- An RTSP relay that carries Home Assistant's go2rtc talk to the speaker.
+- LAN discovery, a CLI and a camera simulator for tests.
+- Typed (`py.typed`, mypy strict). One runtime dependency: aiohttp.
+
+## Ports
 
 The library is local only and needs no cloud. It uses three ports on the camera:
 
@@ -371,3 +391,27 @@ python -m pytest -q
 ```
 
 The tests run against `sannce_aio.simulator.CameraSimulator`, a fake camera on localhost. They need no camera.
+
+## Security
+
+The camera's protocol has no encryption, see [Login](#login). Anyone who can read your LAN traffic can read the password.
+
+- Keep the camera on a trusted LAN, best on its own VLAN.
+- Never forward ports 80, 554 or 3002 of the camera to the internet.
+- Give the camera a password you use nowhere else.
+
+Report a vulnerability in this library privately, as [SECURITY.md](https://github.com/Paol0B/sannce-aio/blob/master/SECURITY.md) says. Do not open a public issue for it.
+
+## Legal
+
+**Trademarks.** SANNCE, Tiandy, ONVIF and the other product names here are trademarks of their owners. They appear only to say which devices this library works with. None of those owners make, endorse or support it.
+
+**Interoperability.** This is an independently written program. Its only purpose is to let a camera you own work with your own software. It holds no code, firmware, keys or files from the camera vendor. It logs in through the camera's own login, with your credentials, and does not bypass any access control or copy protection. EU law lets the user of a program study how it works, and decompile it within limits, so that an independent program can work with it ([Directive 2009/24/EC](https://eur-lex.europa.eu/eli/dir/2009/24/oj), art. 5(3) and 6). US law has a similar exemption ([17 U.S.C. § 1201(f)](https://www.law.cornell.edu/uscode/text/17/1201)). If you hold rights in something here and think it should not be published, open an issue or write to paolobertinetti200f4@proton.me.
+
+**Privacy and lawful use.** Use the library only with cameras you own or may manage. You are responsible for how you use the camera. In the EU, the [GDPR](https://eur-lex.europa.eu/eli/reg/2016/679/oj) applies when a camera films beyond your own private space ([CJEU, C-212/13 Ryneš](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:62013CJ0212); [EDPB Guidelines 3/2019](https://www.edpb.europa.eu/our-work-tools/our-documents/guidelines/guidelines-32019-processing-personal-data-through-video_en)). The library talks only to the camera and sends nothing anywhere else.
+
+**No warranty.** The software comes as is, without warranty. The license excludes liability as far as the law allows (sections 7 and 8). It is not a certified alarm, safety or security system. This is free and open-source software, written and shared without payment and outside any commercial activity, as the EU [Cyber Resilience Act](https://eur-lex.europa.eu/eli/reg/2024/2847/oj) and [Product Liability Directive](https://eur-lex.europa.eu/eli/dir/2024/2853/oj) use the term.
+
+## License
+
+Copyright 2026 Paolo Bertinetti. Licensed under the [Apache License 2.0](https://github.com/Paol0B/sannce-aio/blob/master/LICENSE). See [NOTICE](https://github.com/Paol0B/sannce-aio/blob/master/NOTICE).
