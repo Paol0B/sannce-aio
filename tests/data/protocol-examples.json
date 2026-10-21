@@ -1,0 +1,789 @@
+{
+  "examples": [
+    {
+      "id": "framing_parameter_get_request",
+      "section": "framing",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf501003d000000000000000000000029003139322e3136382e312e31300950524f585909434d4409474554504152414d093230093009320a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 1,
+        "total_length": 61,
+        "payload_length": 41,
+        "payload": [
+          "192.168.1.10",
+          "PROXY",
+          "CMD",
+          "GETPARAM",
+          "20",
+          "0",
+          "2"
+        ],
+        "device_ip": "192.168.1.10",
+        "route": "PROXY",
+        "parameter_type": 20,
+        "parameter": "PTZ device type (COM port, address, device-type string); reply most likely INNER PARAGET PTZ_PROTOCOL",
+        "channel": 0,
+        "session_id": 2,
+        "uncertain": "Header bytes 4-5 (sequence 1) assume LOGON was the only earlier packet on this connection. The last field (session id 2) assumes no earlier GETPARAM, snapshot or ITS query since channel setup. The reply name PTZ_PROTOCOL is inferred: it is the only message that carries the three values type 20 reads. All other bytes follow from the vendor client; the device IP is an input."
+      }
+    },
+    {
+      "id": "framing_two_messages_one_read",
+      "section": "framing",
+      "direction": "camera_to_client",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5000046000000000000000000000032003139322e3136382e312e313009495009494e4e455209434d4409474554504152414d0946494e4953484544093209300a0a0af1f5eaf5010048000000000000000000000034003139322e3136382e312e313009495009494e4e455209434d4409474554444556494345504152414d0946494e49534845440a0a0a",
+      "fields": {
+        "read_length": 142,
+        "message_1": {
+          "offset": 0,
+          "total_length": 70,
+          "payload": [
+            "192.168.1.10",
+            "IP",
+            "INNER",
+            "CMD",
+            "GETPARAM",
+            "FINISHED",
+            "2",
+            "0"
+          ],
+          "session_id": 2,
+          "result": 0
+        },
+        "message_2": {
+          "offset": 70,
+          "total_length": 72,
+          "payload": [
+            "192.168.1.10",
+            "IP",
+            "INNER",
+            "CMD",
+            "GETDEVICEPARAM",
+            "FINISHED"
+          ]
+        },
+        "uncertain": "The vendor client ignores header bytes 4-5 and 8-19, so their camera-side values (sequence 0 and 1, zero bytes, payload length) are guesses. The first field (camera IP) and the route IP in each payload are guesses; the vendor client accepts any first field and the route IP or PROXY. The two messages only need the magic and the total length at offset 6 to be split."
+      }
+    },
+    {
+      "id": "logon_request",
+      "section": "login",
+      "direction": "client_to_camera",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf500005c000000000000000000000048003139322e3136382e312e31300949500955534552094c4f474f4e09595752746157343d0959575274615734784d6a4d3d090933095554462d380938303533303633363709310a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 0,
+        "total_length": 92,
+        "payload_length": 72,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "USER",
+          "LOGON",
+          "YWRtaW4=",
+          "YWRtaW4xMjM=",
+          "",
+          "3",
+          "UTF-8",
+          "805306367",
+          "1"
+        ],
+        "device_ip": "192.168.1.10",
+        "route": "IP",
+        "username": "admin",
+        "password": "admin123",
+        "username_base64": "YWRtaW4=",
+        "password_base64": "YWRtaW4xMjM=",
+        "session_token": "",
+        "f8": "3",
+        "charset": "UTF-8",
+        "f10": "805306367",
+        "meaning": "phase 1 of the login: the user name and the password in base64. The I91FX answers LOGONFAILED 3, which asks for the salted MD5 form (see logon_reply_needs_md5).",
+        "uncertain": "The credentials and the device IP are placeholders. The camera echoes the first field, so any address works. Sequence 0 assumes LOGON is the first packet on the connection. The vendor SDK sends 12 fields with F8 set to 0; the I91FX takes the 11-field form of the web player, which is the form shown here."
+      },
+      "evidence": [
+        "web:/external/noplugin-master/h5player.js.gz"
+      ]
+    },
+    {
+      "id": "logon_reply_needs_md5",
+      "section": "login",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf5000054000000000000000000000040003139322e3136382e312e313009495009494e4e45520955534552094c4f474f4e4641494c45440933093109310941414543417751464267633d093009300a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 0,
+        "total_length": 84,
+        "payload_length": 64,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "INNER",
+          "USER",
+          "LOGONFAILED",
+          "3",
+          "1",
+          "1",
+          "AAECAwQFBgc=",
+          "0",
+          "0"
+        ],
+        "route": "IP",
+        "reason": 3,
+        "salt_base64": "AAECAwQFBgc=",
+        "salt_hex": "0001020304050607",
+        "meaning": "reason 3 asks the client to send the salted MD5 form. The salt is 8 bytes in base64 and changes on every connection. The two 1 fields and the two trailing 0 fields are as the camera sent them; their meaning is not decoded.",
+        "uncertain": "The salt is a placeholder: a real one differs on each connection. The camera echoes the first field of the request. Header bytes 4-5 and 8-17 were not recorded; the library builds them as zero."
+      },
+      "evidence": [
+        "web:/external/noplugin-master/h5player.js.gz"
+      ]
+    },
+    {
+      "id": "logon_md5_request",
+      "section": "login",
+      "direction": "client_to_camera",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf501007000000000000000000000005c003139322e3136382e312e31300949500955534552094c4f474f4e0936587a314634446d764a794d34665a2f4478456c53673d3d096c324256534755333839472f76656a664c5a58584e513d3d090933095554462d38093009310a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 1,
+        "total_length": 112,
+        "payload_length": 92,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "USER",
+          "LOGON",
+          "6Xz1F4DmvJyM4fZ/DxElSg==",
+          "l2BVSGU389G/vejfLZXXNQ==",
+          "",
+          "3",
+          "UTF-8",
+          "0",
+          "1"
+        ],
+        "device_ip": "192.168.1.10",
+        "route": "IP",
+        "username_md5_base64": "6Xz1F4DmvJyM4fZ/DxElSg==",
+        "password_md5_base64": "l2BVSGU389G/vejfLZXXNQ==",
+        "salt_base64": "AAECAwQFBgc=",
+        "hash": "base64 of the raw MD5 digest of the UTF-8 text followed by the 8 salt bytes",
+        "f10": "0",
+        "meaning": "phase 2 of the login: MD5 of the user name plus the salt, then MD5 of the password plus the salt. F10 is 0 here and 805306367 in phase 1. The camera then sends INNER CMDID, INNER LOGON CHANNELDATA FINISHED, the PARAGET dump and INNER LOGON FINISHED.",
+        "uncertain": "The credentials and the salt are placeholders; the hashes follow from them. Sequence 1 assumes the first LOGON had sequence 0."
+      },
+      "evidence": [
+        "web:/external/noplugin-master/h5player.js.gz"
+      ]
+    },
+    {
+      "id": "logon_reply_refused",
+      "section": "login",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf5000054000000000000000000000040003139322e3136382e312e313009495009494e4e45520955534552094c4f474f4e4641494c45440932093109310941414543417751464267633d093109300a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 0,
+        "total_length": 84,
+        "payload_length": 64,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "INNER",
+          "USER",
+          "LOGONFAILED",
+          "2",
+          "1",
+          "1",
+          "AAECAwQFBgc=",
+          "1",
+          "0"
+        ],
+        "route": "IP",
+        "reason": 2,
+        "salt_base64": "AAECAwQFBgc=",
+        "meaning": "the camera refuses the credentials. It arrives where INNER CMDID would have come after phase 2. The web player stops retrying on reasons 2 and 4.",
+        "uncertain": "One wrong password was tried, to avoid a lockout. The salt is a placeholder. Header bytes 4-5 and 8-17 were not recorded; the library builds them as zero. The meaning of the trailing 1 and 0 is not decoded."
+      },
+      "evidence": [
+        "web:/external/noplugin-master/h5player.js.gz"
+      ]
+    },
+    {
+      "id": "logon_request_password_with_tab",
+      "section": "login",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5000059000000000000000000000045003139322e3136382e312e31300949500955534552094c4f474f4e09595752746157343d095957514a62576c75090930095554462d38093830353330363336370931090a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 0,
+        "total_length": 89,
+        "payload_length": 69,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "USER",
+          "LOGON",
+          "YWRtaW4=",
+          "YWQJbWlu",
+          "",
+          "0",
+          "UTF-8",
+          "805306367",
+          "1",
+          ""
+        ],
+        "username": "admin",
+        "password": "ad\tmin",
+        "password_raw_bytes": "61 64 09 6d 69 6e",
+        "password_base64": "YWQJbWlu",
+        "text_encoding": "credential bytes are taken as given (UTF-8 by default) then base64-encoded; the tab 0x09 becomes base64 and never appears as a literal field separator",
+        "uncertain": "Same as logon_request: F11 is 1 by default, F7 and F12 empty, F8 is 0, sequence 0 assumes the first packet. The point of this example is the base64 of a password holding a tab."
+      }
+    },
+    {
+      "id": "logon_reply_success",
+      "section": "login",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf500003b000000000000000000000027003139322e3136382e312e313009495009494e4e4552094c4f474f4e0946494e49534845440a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "total_length": 59,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "INNER",
+          "LOGON",
+          "FINISHED"
+        ],
+        "meaning": "INNER LOGON FINISHED ends the login. It carries no device id, model, serial, firmware or channel count. On the I91FX it follows INNER CMDID, INNER LOGON CHANNELDATA FINISHED and a PARAGET dump.",
+        "uncertain": "The camera echoes the first field of the client's LOGON and sends route IP. Header bytes 4-5 and 8-17 were not recorded; the library builds them as zero."
+      }
+    },
+    {
+      "id": "logoff_request",
+      "section": "login",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5050038000000000000000000000024003139322e3136382e312e31300949500955534552094c4f474f46460961646d696e0a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 5,
+        "total_length": 56,
+        "payload_length": 36,
+        "payload": [
+          "192.168.1.10",
+          "IP",
+          "USER",
+          "LOGOFF",
+          "admin"
+        ],
+        "username": "admin",
+        "meaning": "LOGOFF after a plain second login phase; the user name is cleartext in F5",
+        "uncertain": "The sequence number (shown as 5) depends on how many packets went before logoff, so it is a guess. This is the form after a plain second phase; after an encrypted second phase the vendor client sends an encrypted user name instead, and after a first-phase-only logon it sends no LOGOFF at all."
+      }
+    },
+    {
+      "id": "heartbeat_request",
+      "section": "heartbeat",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf502001400000000000000000000000000",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 2,
+        "total_length": 20,
+        "payload_length": 0,
+        "payload": [],
+        "meaning": "empty command packet: header only, no fields and no terminator; the vendor SDK sends it every 3 seconds",
+        "uncertain": "Header bytes 4-5 (sequence 2) assume the two LOGON packets were the only earlier traffic on this connection. A real heartbeat carries the counter's current value, which depends on every earlier packet. All other bytes follow from the vendor client."
+      }
+    },
+    {
+      "id": "event_motion_start",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf500005a000000000000000000000046003139322e3136382e312e31300950524f585909494e4e455209414c41524d094d4f54494f4e4445544543540930093109303031323331303031393130303433350a0a0a0a0a0a",
+      "fields": {
+        "payload": [
+          "192.168.1.10",
+          "PROXY",
+          "INNER",
+          "ALARM",
+          "MOTIONDETECT",
+          "0",
+          "1",
+          "0012310019100435"
+        ],
+        "terminators": 2,
+        "route": "PROXY",
+        "command": "INNER ALARM MOTIONDETECT",
+        "channel": 0,
+        "alarm_state": 1,
+        "alarm_id": "0012310019100435",
+        "kind": "motion",
+        "meaning": "motion on channel 0, alarm active. The I91FX repeats this message once per second while a person is in view, with the same 16-digit id.",
+        "uncertain": "The first field is the camera address as a placeholder. Header bytes 4-5 and 8-17 were not recorded; the library builds them as zero."
+      }
+    },
+    {
+      "id": "event_motion_stop",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf500005a000000000000000000000046003139322e3136382e312e31300950524f585909494e4e455209414c41524d094d4f54494f4e4445544543540930093009303031323331303031393130303433350a0a0a0a0a0a",
+      "fields": {
+        "payload": [
+          "192.168.1.10",
+          "PROXY",
+          "INNER",
+          "ALARM",
+          "MOTIONDETECT",
+          "0",
+          "0",
+          "0012310019100435"
+        ],
+        "terminators": 2,
+        "route": "PROXY",
+        "command": "INNER ALARM MOTIONDETECT",
+        "channel": 0,
+        "alarm_state": 0,
+        "alarm_id": "0012310019100435",
+        "kind": "motion",
+        "meaning": "motion cleared on channel 0. The stop is one message with state 0 and the id of the start; there is no separate stop command.",
+        "uncertain": "Same header note as event_motion_start. The camera sent a stop at the end of the events seen. That does not prove it always does, so the library keeps its 10-second timer."
+      }
+    },
+    {
+      "id": "event_smart_person",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_ws",
+      "status": "verified",
+      "source": "I91FX, 2026-10-15",
+      "hex": "f1f5eaf500005a000000000000000000000046003139322e3136382e312e31300950524f585909494e4e455209414c41524d094d4f54494f4e4445544543540930093109303031323331303031393130303433350a0a0a0a0a0a",
+      "fields": {
+        "payload": [
+          "192.168.1.10",
+          "PROXY",
+          "INNER",
+          "ALARM",
+          "MOTIONDETECT",
+          "0",
+          "1",
+          "0012310019100435"
+        ],
+        "terminators": 2,
+        "route": "PROXY",
+        "command": "INNER ALARM MOTIONDETECT",
+        "channel": 0,
+        "alarm_state": 1,
+        "alarm_id": "0012310019100435",
+        "kind": "person",
+        "meaning": "a person in view on channel 0. With person and vehicle detection on and all-motion off, the I91FX sends a person as MOTIONDETECT. An object moving with no person in view gave no event. The bytes are those of event_motion_start.",
+        "uncertain": "The native protocol has no dedicated person command. Same header note as event_motion_start."
+      }
+    },
+    {
+      "id": "event_smart_vehicle",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5000047000000000000000000000033003139322e3136382e312e313009495009494e4e455209414c41524d094d4f54494f4e4445544543545f434152093009310a0a0a",
+      "fields": {
+        "payload": ["192.168.1.10", "IP", "INNER", "ALARM", "MOTIONDETECT_CAR", "0", "1"],
+        "command": "INNER ALARM MOTIONDETECT_CAR",
+        "channel": 0,
+        "alarm_state": 1,
+        "kind": "vehicle",
+        "meaning": "vehicle motion on channel 0, active; MOTIONDETECT_CAR is the dedicated vehicle command",
+        "uncertain": "Same header guesses as event_motion_start. The kind vehicle is inferred from the _CAR suffix, aided by the app's person and car alarm names. The alarm-state value 1 (active) is inferred."
+      }
+    },
+    {
+      "id": "event_vca_intrusion",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5000064000000000000000000000050003139322e3136382e312e313009495009494e4e455209414c41524d0956434109300931093009320930093009303a303a303a300930093009302c302c302c302c302c302c3009300930093009090a0a0a",
+      "fields": {
+        "payload": ["192.168.1.10", "IP", "INNER", "ALARM", "VCA", "0", "1", "0", "2", "0", "0", "0:0:0:0", "0", "0", "0,0,0,0,0,0,0", "0", "0", "0", "", ""],
+        "command": "INNER ALARM VCA",
+        "channel": 0,
+        "alarm_state": 1,
+        "rule_type": 2,
+        "kind": "intrusion",
+        "meaning": "VCA alarm on channel 0, active; A4=2 (perimeter) maps to intrusion; no targets or rules in this example",
+        "uncertain": "Same header guesses as event_motion_start. VCA is variable length; this example uses zero target-group and rule counts, so the nested arrays are empty and the two trailing name strings are empty. The A4 value-to-rule map is not decoded: A4=2 is read as perimeter/intrusion and A4=0 as tripwire/line from the app's list of VCA alarm types, so the kind is inferred."
+      }
+    },
+    {
+      "id": "event_video_cover",
+      "section": "events",
+      "direction": "camera_to_client",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf500004100000000000000000000002d003139322e3136382e312e313009495009494e4e455209414c41524d09564944454f434f564552093009310a0a0a",
+      "fields": {
+        "payload": ["192.168.1.10", "IP", "INNER", "ALARM", "VIDEOCOVER", "0", "1"],
+        "command": "INNER ALARM VIDEOCOVER",
+        "channel": 0,
+        "alarm_state": 1,
+        "kind": "tamper",
+        "meaning": "lens cover (tamper) alarm on channel 0, active",
+        "uncertain": "Same header guesses as event_motion_start. A2 is the cover state of the channel. The kind tamper follows the cover meaning and the app's cover alarm name. The alarm-state value 1 (active) is inferred."
+      }
+    },
+    {
+      "id": "talk_start_request",
+      "section": "talk",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5080039000000000000000000000025003139322e3136382e312e3130094e565209300909434d440954414c4b09424547494e0a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 8,
+        "total_length": 57,
+        "payload_length": 37,
+        "payload": ["192.168.1.10", "NVR", "0", "", "CMD", "TALK", "BEGIN"],
+        "device_ip": "192.168.1.10",
+        "route": "NVR",
+        "channel": 0,
+        "command": "CMD TALK BEGIN",
+        "variant": "channel talk; the app uses it for an IP camera added by IP. The wire channel is the app channel minus 1.",
+        "meaning": "client asks to start talk to wire channel 0; the camera replies on route IP with INNER NVR ... BEGIN OK to accept or BEGIN ERROR to refuse",
+        "uncertain": "Sequence 8 is a guess: it is the command-channel counter when talk starts, which depends on all earlier packets. The two optional fields (audio encode type and sample rate) are omitted; the vendor client appends them only when the camera advertises a talk coder list. The single-talk variant would use route PROXY and no channel. The I91FX accepts TALK BEGIN over WebSocket but plays nothing (2026-10-15); sound goes through the RTSP backchannel."
+      }
+    },
+    {
+      "id": "talk_refused_busy",
+      "section": "talk",
+      "direction": "camera_to_client",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf5000048000000000000000000000034003139322e3136382e312e313009495009494e4e4552094e565209300909434d440954414c4b09424547494e094552524f520a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "total_length": 72,
+        "payload_length": 52,
+        "payload": ["192.168.1.10", "IP", "INNER", "NVR", "0", "", "CMD", "TALK", "BEGIN", "ERROR"],
+        "route": "IP",
+        "channel": 0,
+        "command": "INNER NVR ... CMD TALK BEGIN ERROR",
+        "meaning": "camera refuses channel talk. A camera message carries route IP or PROXY, and the channel-talk reply starts INNER NVR. The index base: the vendor client counts tokens from INNER after the IP and route are stripped, so channel is at index 2, BEGIN/END at 6, OK/ERROR at 7. Tokens 3-5 (here empty, CMD, TALK) are not read.",
+        "uncertain": "The vendor client ignores header bytes 4-5 and 8-19, so sequence, zero bytes and payload length are guesses. Route IP and the INNER NVR command prefix follow the vendor client, which accepts only IP or PROXY as the route of a camera message. Tokens 3-5 are not read, so their values are a guess shown to mirror the request. The busy trigger (another client holding talk) is a likely cause, inferred, not seen in the vendor client. The I91FX accepts TALK BEGIN over WebSocket but plays nothing (2026-10-15); sound goes through the RTSP backchannel."
+      }
+    },
+    {
+      "id": "talk_audio_frame_g711a",
+      "section": "talk",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf900000000c0a8010a00007900000000004e56520009000900094e5653000a01a8c000012800d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+      "fields": {
+        "magic": "0xf9eaf5f1",
+        "transport": "data packet sent on the command connection",
+        "data_sequence": 0,
+        "header_ip": "192.168.1.10 at offset 8, network order c0 a8 01 0a",
+        "total_length": 121,
+        "payload_length": 101,
+        "codec": "G711A (id 1)",
+        "channel": 0,
+        "payload_layout": {
+          "nvr_marker": "4e 56 52 00",
+          "tab": "09",
+          "channel_bytes": "00",
+          "tab2_zero_tab3": "09 00 09",
+          "nvs_marker": "4e 56 53 00",
+          "nvs_ip_byteswapped": "0a 01 a8 c0",
+          "audio_subheader": "00 01 28 00",
+          "audio": "80 bytes G711A"
+        },
+        "meaning": "one channel-0 G711A audio sub-frame; the client wraps it in a 0xF9EAF5F1 data packet and sends it on the command connection",
+        "uncertain": "The 80 audio bytes are G711A of PCM silence (0xd5), a placeholder: real bytes come from the microphone. The data sequence number is a separate counter that depends on earlier audio. The NVS-block IP is the device IP in reverse byte order. The payload starts with NVR, so the vendor client's NVS skip-8 rule would not apply, but the camera is the receiver here and its parsing is not visible. The I91FX accepts TALK BEGIN over WebSocket but plays nothing (2026-10-15); sound goes through the RTSP backchannel."
+      }
+    },
+    {
+      "id": "talk_stop_request",
+      "section": "talk",
+      "direction": "client_to_camera",
+      "transport": "nvs_tcp",
+      "status": "inferred",
+      "hex": "f1f5eaf50c0037000000000000000000000023003139322e3136382e312e3130094e565209300909434d440954414c4b09454e440a0a0a",
+      "fields": {
+        "magic": "0xf5eaf5f1",
+        "sequence": 12,
+        "total_length": 55,
+        "payload_length": 35,
+        "payload": ["192.168.1.10", "NVR", "0", "", "CMD", "TALK", "END"],
+        "device_ip": "192.168.1.10",
+        "route": "NVR",
+        "channel": 0,
+        "command": "CMD TALK END",
+        "meaning": "client stops channel talk to wire channel 0; the camera acknowledges with CMD TALK END OK. The single-talk variant uses route PROXY and no channel.",
+        "uncertain": "Sequence 12 is a guess: it depends on all earlier packets on the command channel. The stop mirrors the start with END in place of BEGIN. The I91FX accepts TALK BEGIN over WebSocket but plays nothing (2026-10-15); sound goes through the RTSP backchannel."
+      }
+    },
+    {
+      "id": "discovery_seek_request",
+      "section": "discovery",
+      "direction": "client_to_camera",
+      "transport": "nvs_udp",
+      "status": "static",
+      "hex": "bebee5e5000000001e004950094950094e45574d3456303009434d44095345454b4e5653530a0a0a",
+      "fields": {
+        "magic": "0xe5e5bebe",
+        "id": 0,
+        "flag": 0,
+        "payload_length": 30,
+        "total_length": 40,
+        "payload": [
+          "IP",
+          "IP",
+          "NEWM4V00",
+          "CMD",
+          "SEEKNVSS"
+        ],
+        "source_port": 6001,
+        "destinations": [
+          "234.56.78.9:3000",
+          "234.56.78.9:4000",
+          "239.255.255.250:3000",
+          "239.255.255.250:4000"
+        ],
+        "meaning": "the app's LAN search: these 40 bytes are sent four times from UDP port 6001, to each of two multicast groups on ports 3000 and 4000. The datagram has no input.",
+        "uncertain": "None in the bytes: all 40 are constants in the vendor client. Which port the camera listens on and where it sends the reply are not visible; see the open questions."
+      }
+    },
+    {
+      "id": "discovery_reply",
+      "section": "discovery",
+      "direction": "camera_to_client",
+      "transport": "nvs_udp",
+      "status": "inferred",
+      "hex": "bebee5e500000000a8004e45574d3456303009434d44094e5653530932613a35333a30303a35653a30303a3030093235352e3235352e3235352e30093139322e3136382e312e31093139322e3136382e312e31093109333030300934303030093409383009094944303030303030310956312e302e300956312e302e300909090909093109094d4f44454c2d580909534e3030303030303030303109090909090909093139322e3136382e312e31300a0a0a",
+      "fields": {
+        "magic": "0xe5e5bebe",
+        "id": 0,
+        "flag": 0,
+        "payload_length": 168,
+        "total_length": 178,
+        "marker": "NEWM4V00",
+        "payload": [
+          "CMD",
+          "NVSS",
+          "2a:53:00:5e:00:00",
+          "255.255.255.0",
+          "192.168.1.1",
+          "192.168.1.1",
+          "1",
+          "3000",
+          "4000",
+          "4",
+          "80",
+          "",
+          "ID0000001",
+          "V1.0.0",
+          "V1.0.0",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "1",
+          "",
+          "MODEL-X",
+          "",
+          "SN0000000001",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "192.168.1.10"
+        ],
+        "parsed": {
+          "ip": "192.168.1.10",
+          "mac": "00:00:5e:00:53:2a",
+          "mask": "255.255.255.0",
+          "gateway": "192.168.1.1",
+          "dns": "192.168.1.1",
+          "channels": 1,
+          "server_port": 3000,
+          "client_port": 4000,
+          "device_type": 4,
+          "http_port": 80,
+          "product_model": 0,
+          "factory_id": "ID0000001",
+          "firmware_version": "V1.0.0",
+          "web_version": "V1.0.0",
+          "activation": 1,
+          "model": "MODEL-X",
+          "serial": "SN0000000001",
+          "cloud_type": 0,
+          "cloud_product_key": "",
+          "udp_activation": 0
+        },
+        "meaning": "a camera's answer to the search, as the app reads it: the marker, then fields 0 to 32. The app reverses the wire MAC 2a:53:00:5e:00:00 to 00:00:5e:00:53:2a and takes the IP from field 32. Fields 33 to 39 are absent and read as empty or 0.",
+        "uncertain": "Every value is a placeholder except the MAC form and the header id and flag. The I91FX sends the MAC reversed and in lower case, and the header id and flag as 0 and 0 (2026-10-15). The MAC is the RFC 7042 documentation address 00:00:5e:00:53:2a. The real camera's IP, ports, device type, product id, model, serial and versions are not shown here. The absence of bytes before NEWM4V00 is a guess: the app skips anything before the marker. Field 32 may be empty on a real camera; then the IP is the source address of the datagram. The unnamed fields are left empty, and which fields a real camera fills is unknown."
+      }
+    },
+    {
+      "id": "http_device_info_reply",
+      "section": "http",
+      "direction": "camera_to_client",
+      "transport": "http",
+      "status": "inferred",
+      "text": "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 344\r\n\r\n<DeviceInfo><firmwareVersion>1.0.0</firmwareVersion><hardwareVersion>1.0.0</hardwareVersion><mediaVersion>1.0.0</mediaVersion><platformVersionList><platformInfo><name>platform</name><version>1.0.0</version></platformInfo></platformVersionList><sdkVersion>1.0.0</sdkVersion><uiVersion>1.0.0</uiVersion><webVersion>1.0.0</webVersion></DeviceInfo>",
+      "fields": {
+        "method": "GET",
+        "path": "/CGI/System/deviceInfo",
+        "status_code": 200,
+        "root": "DeviceInfo",
+        "firmware_version": "1.0.0",
+        "meaning": "firmware and component versions of the camera; the app reads no model, serial or MAC element",
+        "uncertain": "Every version string, and the platform name, is a placeholder. The status line and headers are guesses: the app tests only for a 2xx status and reads the body. The element order is a guess; the camera's order is unknown. A real reply may carry more elements, such as model, serial number or MAC, which the app drops. The reply may start with a byte order mark or an XML declaration."
+      }
+    },
+    {
+      "id": "http_capabilities_reply",
+      "section": "http",
+      "direction": "camera_to_client",
+      "transport": "http",
+      "status": "inferred",
+      "text": "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 246\r\n\r\n<ChanBasicCapList><capTypeList><capType>00125-MDMotionDetectionSubList</capType><subCap><supportType>people</supportType><supportType>car</supportType><supportType>all</supportType></subCap><support>true</support></capTypeList></ChanBasicCapList>",
+      "fields": {
+        "method": "POST",
+        "path": "/CGI/System/channels/1/capabilities",
+        "request_body": "<CapDiscription><capType><mainType>015-AlarmParam</mainType><subType>00125-MDMotionDetectionSubList</subType></capType></CapDiscription>",
+        "channel": 1,
+        "status_code": 200,
+        "root": "ChanBasicCapList",
+        "person": true,
+        "vehicle": true,
+        "all_motion": true,
+        "meaning": "reply to the person, vehicle and all-motion capability query on channel 1; support is true and supportType lists people, car and all, so all three are present",
+        "uncertain": "The three supportType entries are every value the app knows; the real list depends on the camera. The capType text is a guess: the app does not read it for this query, and the lamp queries suggest the camera echoes the requested subType. The status line, headers and element order are guesses."
+      }
+    },
+    {
+      "id": "http_whitelight_get_reply",
+      "section": "http",
+      "direction": "camera_to_client",
+      "transport": "http",
+      "status": "inferred",
+      "text": "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 223\r\n\r\n<WhiteLight><contrltype opt=\"0,1,2,3\">0</contrltype><infraredFarLampPower>100</infraredFarLampPower><infraredLampPower>100</infraredLampPower><sunRiseTime>06:00:00</sunRiseTime><sunSetTime>18:00:00</sunSetTime></WhiteLight>",
+      "fields": {
+        "method": "GET",
+        "path": "/ISAPI/Image/channels/1/WhiteLight",
+        "channel": 1,
+        "status_code": 200,
+        "root": "WhiteLight",
+        "contrltype": 0,
+        "contrltype_options": [0, 1, 2, 3],
+        "infrared_lamp_power": 100,
+        "infrared_far_lamp_power": 100,
+        "sun_set_time": "18:00:00",
+        "sun_rise_time": "06:00:00",
+        "meaning": "white light of channel 1 is in auto mode (contrltype 0) with both lamps at full power; HTTP channel 1 is channel 0 on the private protocol",
+        "uncertain": "The option list 0,1,2,3, both power values and both times are placeholders: the app shows what the camera sends. The time format HH:MM:SS is inferred from how the app parses the value. The status line, headers and element order are guesses."
+      }
+    },
+    {
+      "id": "http_whitelight_set_manual_on",
+      "section": "http",
+      "direction": "client_to_camera",
+      "transport": "http",
+      "status": "inferred",
+      "text": "PUT /ISAPI/Image/channels/1/WhiteLight HTTP/1.1\r\nHost: 192.168.1.10\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 209\r\n\r\n<WhiteLight><contrltype>1</contrltype><infraredFarLampPower>100</infraredFarLampPower><infraredLampPower>100</infraredLampPower><sunRiseTime>06:00:00</sunRiseTime><sunSetTime>18:00:00</sunSetTime></WhiteLight>",
+      "fields": {
+        "method": "PUT",
+        "path": "/ISAPI/Image/channels/1/WhiteLight",
+        "channel": 1,
+        "root": "WhiteLight",
+        "contrltype": 1,
+        "infrared_lamp_power": 100,
+        "infrared_far_lamp_power": 100,
+        "sun_set_time": "18:00:00",
+        "sun_rise_time": "06:00:00",
+        "meaning": "turns the white light of channel 1 on manually (contrltype 1); the other fields are echoed from the last GET",
+        "uncertain": "The power and time values stand for whatever the last GET returned. The Authorization header is left out. The HTTP version, Host and Content-Length are standard. Whether the camera accepts a body with contrltype alone is not visible in the vendor client. The element order is the order the app sends. The I91FX refuses contrltype 1 with statusCode 3 and statusString Device Error, and lists only 0, 2 and 3 in the opt attribute (2026-10-15)."
+      }
+    },
+    {
+      "id": "http_light_mode_set_smart",
+      "section": "http",
+      "direction": "client_to_camera",
+      "transport": "http",
+      "status": "inferred",
+      "text": "PUT /CGI/System/CommonEnable/channels/1/Type/4120 HTTP/1.1\r\nHost: 192.168.1.10\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 83\r\n\r\n<CommonEnable><enable>true</enable><type>4120</type><value>2</value></CommonEnable>",
+      "fields": {
+        "method": "PUT",
+        "path": "/CGI/System/CommonEnable/channels/1/Type/4120",
+        "channel": 1,
+        "root": "CommonEnable",
+        "enable": true,
+        "type": 4120,
+        "value": 2,
+        "mode": "early-warning (smart dual light)",
+        "meaning": "sets the light mode of channel 1 to 2, early-warning, which lights the white light on a smart event",
+        "uncertain": "The app sends back the document from its last GET with value changed, so enable and type are what the camera reported; true and 4120 are the likely values, by analogy with the other CommonEnable writes. The Authorization header is left out. The element order is the order the app sends."
+      }
+    },
+    {
+      "id": "http_motion_detection_get_reply",
+      "section": "http",
+      "direction": "camera_to_client",
+      "transport": "http",
+      "status": "inferred",
+      "text": "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: 117\r\n\r\n<MotionDetection><allEnabled>false</allEnabled><carEnabled>true</carEnabled><enabled>true</enabled></MotionDetection>",
+      "fields": {
+        "method": "GET",
+        "path": "/ISAPI/System/Video/inputs/channels/1/motionDetection",
+        "channel": 1,
+        "status_code": 200,
+        "root": "MotionDetection",
+        "enabled": true,
+        "car_enabled": true,
+        "all_enabled": false,
+        "meaning": "person detection on, vehicle detection on, all-motion switch off on channel 1; enabled is person, carEnabled is vehicle, allEnabled is generic motion (the app's Picture changes)",
+        "uncertain": "A real reply also carries regionType, Grid and MotionDetectionLayout. Their values are not visible in the vendor client, so they are left out; a client should send them back unchanged on a PUT. The flag values are placeholders. The status line, headers and element order are guesses."
+      }
+    }
+  ]
+}
