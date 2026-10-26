@@ -4,7 +4,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/LICENSE)
 [![Python 3.11 to 3.14](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/pyproject.toml)
 [![Typed](https://img.shields.io/badge/typing-mypy%20strict-blue.svg)](https://github.com/Paol0B/sannce-aio/blob/master/pyproject.toml)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+[![Status: beta](https://img.shields.io/badge/status-beta-orange.svg)](#status)
 
 Asyncio library for SANNCE / Tiandy wired IP cameras on the LAN. The reference model is the I91FW. The camera reports it as I91FX. It powers the Home Assistant integration [ha-sannce](https://github.com/Paol0B/ha-sannce).
 

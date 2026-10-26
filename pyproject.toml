@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sannce-aio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Asyncio library for SANNCE/Tiandy wired IP cameras on the LAN"
 readme = "README.md"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Paolo Bertinetti", email = "paolobertinetti200f4@proton.me" }]
 keywords = ["sannce", "tiandy", "ip-camera", "asyncio", "home-assistant"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
